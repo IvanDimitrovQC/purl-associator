@@ -27,6 +27,9 @@ python = ">=3.13,<3.14"
 [feature.lite.tasks]
 "mappings:merge" = "python -m scripts.merge_mappings"
 "mappings:validate" = "python -m scripts.validate"
+"sbom:generate" = "python -m scripts.generate_sbom"
+"osv:correlate" = "python -m scripts.correlate_osv"
+"sbom:test" = "python -m unittest discover -s tests"
 
 [environments]
 default = ["lite"]

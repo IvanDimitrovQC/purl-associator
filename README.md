@@ -132,6 +132,53 @@ A downstream CVE project should consume `web/public/mappings.json` or the split
 4. apply OSV/NVD affected-version logic in that downstream project, and
 5. store CVE assignment/review state outside this repository.
 
+## Local SBOM demo
+
+This fork also includes a small local CycloneDX generator that demonstrates the
+first downstream step: enrich one concrete conda-forge artifact with its mapped
+upstream PURL. The generated files are written under `local-advisory-channel/`
+and are ignored by git.
+
+```sh
+pixi run -e lite sbom:generate pandas
+```
+
+By default the command reads the split mapping payload, uses the mapped
+`version`/`build`/`subdir` as artifact coordinates, fetches conda-forge
+`repodata.json` for that subdir, and writes:
+
+```text
+local-advisory-channel/<subdir>/sboms/<filename>.cdx.json
+```
+
+For offline or reproducible runs, pass a local repodata file:
+
+```sh
+pixi run -e lite sbom:generate pandas --repodata /path/to/repodata.json
+```
+
+The SBOM subject is the conda artifact (`metadata.component`). The mapped PyPI
+PURL is emitted as a CycloneDX component with the artifact version added, so a
+later OSV correlator can read component PURLs directly.
+
+You can then query OSV for the component PURLs in that SBOM:
+
+```sh
+pixi run -e lite osv:correlate \
+  local-advisory-channel/<subdir>/sboms/<filename>.cdx.json
+```
+
+The correlator calls OSV's `/v1/querybatch` endpoint with versioned component
+PURLs and writes:
+
+```text
+local-advisory-channel/<subdir>/advisories/<filename>.osv.json
+```
+
+That sidecar contains the SBOM subject, the queried components, skipped
+unversioned PURLs, and flattened vulnerability findings for a future advisory
+channel index.
+
 ## Verification
 
 Run these checks before opening a PR:
@@ -139,6 +186,7 @@ Run these checks before opening a PR:
 ```sh
 pixi run -e lite mappings:merge
 pixi run -e lite mappings:validate
+pixi run -e lite sbom:test
 pixi run app:check
 ```
 
