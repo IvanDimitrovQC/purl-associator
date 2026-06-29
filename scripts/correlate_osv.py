@@ -8,15 +8,34 @@ local SBOM channel.
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
+import logging
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
+from scripts.s3_publish import (
+    S3PublishError,
+    add_s3_args,
+    cleanup_uploaded_files,
+    print_cleanup_summary,
+    print_s3_summary,
+    upload_files,
+)
+
 DEFAULT_OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+DEFAULT_OSV_BATCH_SIZE = 250
+DEFAULT_OSV_RETRIES = 3
+DEFAULT_OSV_RETRY_DELAY_SECONDS = 1.0
+ADVISORY_VERSION_PREFIX = "v1"
+LOGGER = logging.getLogger("scripts.correlate_osv")
 
 
 class OsvError(RuntimeError):
@@ -36,6 +55,14 @@ def _load_json_path(path: Path) -> dict[str, Any]:
     return data
 
 
+def _canonical_json(data: Any) -> str:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _sha256(data: Any) -> str:
+    return hashlib.sha256(_canonical_json(data).encode()).hexdigest()
+
+
 def _has_version(purl: str) -> bool:
     base = purl.split("#", 1)[0].split("?", 1)[0]
     return "@" in base.rsplit("/", 1)[-1]
@@ -46,11 +73,15 @@ def _component_identity(component: dict[str, Any]) -> dict[str, str | None]:
         "bom_ref": component.get("bom-ref")
         if isinstance(component.get("bom-ref"), str)
         else None,
-        "name": component.get("name") if isinstance(component.get("name"), str) else None,
+        "name": component.get("name")
+        if isinstance(component.get("name"), str)
+        else None,
         "version": component.get("version")
         if isinstance(component.get("version"), str)
         else None,
-        "purl": component.get("purl") if isinstance(component.get("purl"), str) else None,
+        "purl": component.get("purl")
+        if isinstance(component.get("purl"), str)
+        else None,
     }
 
 
@@ -75,7 +106,23 @@ def extract_component_purls(sbom: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _retry_after_seconds(exc: HTTPError, fallback: float) -> float:
+    retry_after = exc.headers.get("Retry-After")
+    if retry_after is None:
+        return fallback
+    try:
+        return max(float(retry_after), 0.0)
+    except ValueError:
+        return fallback
+
+
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    retries: int = DEFAULT_OSV_RETRIES,
+    retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
+) -> dict[str, Any]:
     body = json.dumps(payload).encode()
     request = Request(
         url,
@@ -87,23 +134,63 @@ def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
         },
         method="POST",
     )
-    try:
-        with urlopen(request, timeout=60) as response:
-            data = json.load(response)
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise OsvError(f"OSV request failed with HTTP {exc.code}: {detail}") from exc
-    except URLError as exc:
-        raise OsvError(f"OSV request failed: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise OsvError(f"OSV returned invalid JSON: {exc}") from exc
+    for attempt in range(retries + 1):
+        try:
+            LOGGER.info(
+                "posting OSV request url=%s query_count=%d attempt=%d",
+                url,
+                len(payload.get("queries") or []),
+                attempt + 1,
+            )
+            with urlopen(request, timeout=60) as response:
+                data = json.load(response)
+            break
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            retryable = exc.code == 429 or 500 <= exc.code <= 599
+            if retryable and attempt < retries:
+                fallback = retry_delay_seconds * (2**attempt)
+                delay = _retry_after_seconds(exc, fallback)
+                LOGGER.warning(
+                    "OSV request retry http_status=%s attempt=%d delay_seconds=%.2f",
+                    exc.code,
+                    attempt + 1,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            LOGGER.error("OSV request failed http_status=%s error=%s", exc.code, detail)
+            raise OsvError(
+                f"OSV request failed with HTTP {exc.code}: {detail}"
+            ) from exc
+        except URLError as exc:
+            if attempt < retries:
+                delay = retry_delay_seconds * (2**attempt)
+                LOGGER.warning(
+                    "OSV request retry error=%s attempt=%d delay_seconds=%.2f",
+                    exc.reason,
+                    attempt + 1,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            LOGGER.error("OSV request failed error=%s", exc.reason)
+            raise OsvError(f"OSV request failed: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise OsvError(f"OSV returned invalid JSON: {exc}") from exc
+    else:
+        raise OsvError("OSV request failed after retries")
     if not isinstance(data, dict):
         raise OsvError("OSV returned a non-object JSON payload")
     return data
 
 
 def query_osv_batch(
-    purls: list[str], *, api_url: str = DEFAULT_OSV_BATCH_URL
+    purls: list[str],
+    *,
+    api_url: str = DEFAULT_OSV_BATCH_URL,
+    retries: int = DEFAULT_OSV_RETRIES,
+    retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return ``{purl: vulns}``, following OSV querybatch pagination."""
 
@@ -111,6 +198,11 @@ def query_osv_batch(
     pending = [{"purl": purl, "page_token": None} for purl in purls]
 
     while pending:
+        LOGGER.info(
+            "querying OSV batch api_url=%s query_count=%d",
+            api_url,
+            len(pending),
+        )
         payload = {
             "queries": [
                 {
@@ -124,7 +216,12 @@ def query_osv_batch(
                 for item in pending
             ]
         }
-        response = _post_json(api_url, payload)
+        response = _post_json(
+            api_url,
+            payload,
+            retries=retries,
+            retry_delay_seconds=retry_delay_seconds,
+        )
         batch_results = response.get("results")
         if not isinstance(batch_results, list):
             raise OsvError("OSV response is missing results[]")
@@ -134,6 +231,7 @@ def query_osv_batch(
             )
 
         next_pending: list[dict[str, str | None]] = []
+        vulnerability_count = 0
         for item, result in zip(pending, batch_results, strict=True):
             if not isinstance(result, dict):
                 raise OsvError("OSV result entry must be an object")
@@ -142,11 +240,65 @@ def query_osv_batch(
                 raise OsvError("OSV result vulns must be an array")
             purl = str(item["purl"])
             results[purl].extend(v for v in vulns if isinstance(v, dict))
+            vulnerability_count += len([v for v in vulns if isinstance(v, dict)])
             token = result.get("next_page_token")
             if isinstance(token, str) and token:
                 next_pending.append({"purl": purl, "page_token": token})
+        LOGGER.info(
+            "OSV batch complete query_count=%d vulnerability_count=%d next_pages=%d",
+            len(pending),
+            vulnerability_count,
+            len(next_pending),
+        )
         pending = next_pending
 
+    return results
+
+
+def query_osv_chunked(
+    purls: list[str],
+    *,
+    api_url: str = DEFAULT_OSV_BATCH_URL,
+    batch_size: int = DEFAULT_OSV_BATCH_SIZE,
+    delay_seconds: float = 0.0,
+    retries: int = DEFAULT_OSV_RETRIES,
+    retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
+) -> dict[str, list[dict[str, Any]]]:
+    if batch_size < 1:
+        raise OsvError("--batch-size must be at least 1")
+
+    unique_purls = list(dict.fromkeys(purls))
+    LOGGER.info(
+        "querying OSV in chunks unique_purls=%d batch_size=%d api_url=%s",
+        len(unique_purls),
+        batch_size,
+        api_url,
+    )
+    results: dict[str, list[dict[str, Any]]] = {}
+    for index in range(0, len(unique_purls), batch_size):
+        if delay_seconds > 0 and index > 0:
+            time.sleep(delay_seconds)
+        chunk = unique_purls[index : index + batch_size]
+        LOGGER.info(
+            "querying OSV chunk start=%d end=%d total=%d",
+            index + 1,
+            index + len(chunk),
+            len(unique_purls),
+        )
+        results.update(
+            query_osv_batch(
+                chunk,
+                api_url=api_url,
+                retries=retries,
+                retry_delay_seconds=retry_delay_seconds,
+            )
+        )
+        LOGGER.info(
+            "OSV chunk complete start=%d end=%d total=%d",
+            index + 1,
+            index + len(chunk),
+            len(unique_purls),
+        )
     return results
 
 
@@ -181,10 +333,11 @@ def _flatten_findings(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return findings
 
 
-def correlate_sbom(
+def correlate_sbom_with_results(
     sbom: dict[str, Any],
     *,
     source_sbom: str,
+    osv_results: dict[str, list[dict[str, Any]]],
     api_url: str = DEFAULT_OSV_BATCH_URL,
 ) -> dict[str, Any]:
     components = extract_component_purls(sbom)
@@ -195,7 +348,12 @@ def correlate_sbom(
         if not c.get("queryable")
     ]
     purls = [str(c["purl"]) for c in queryable]
-    osv_results = query_osv_batch(purls, api_url=api_url) if purls else {}
+    LOGGER.info(
+        "correlating SBOM with OSV results source_sbom=%s queryable=%d skipped=%d",
+        source_sbom,
+        len(queryable),
+        len(skipped),
+    )
 
     correlated: list[dict[str, Any]] = []
     for component in queryable:
@@ -228,11 +386,104 @@ def correlate_sbom(
     }
 
 
+def correlate_sbom(
+    sbom: dict[str, Any],
+    *,
+    source_sbom: str,
+    api_url: str = DEFAULT_OSV_BATCH_URL,
+) -> dict[str, Any]:
+    purls = [
+        str(component["purl"])
+        for component in extract_component_purls(sbom)
+        if component.get("queryable")
+    ]
+    LOGGER.info(
+        "querying OSV for SBOM source_sbom=%s query_count=%d",
+        source_sbom,
+        len(purls),
+    )
+    osv_results = query_osv_batch(purls, api_url=api_url) if purls else {}
+    return correlate_sbom_with_results(
+        sbom,
+        source_sbom=source_sbom,
+        osv_results=osv_results,
+        api_url=api_url,
+    )
+
+
+def normalized_advisory(advisory: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(advisory)
+    normalized.pop("generated_at", None)
+    normalized.pop("correlation_version", None)
+    return normalized
+
+
+def advisory_content_hash(advisory: dict[str, Any]) -> str:
+    return _sha256(normalized_advisory(advisory))[:12]
+
+
+def finalized_advisory(advisory: dict[str, Any]) -> dict[str, Any]:
+    finalized = copy.deepcopy(advisory)
+    finalized["correlation_version"] = (
+        f"{ADVISORY_VERSION_PREFIX}-{advisory_content_hash(advisory)}"
+    )
+    return finalized
+
+
 def default_output_path(sbom_path: Path) -> Path:
+    if (
+        sbom_path.name.startswith("sbom-")
+        and sbom_path.name.endswith(".cdx.json")
+        and sbom_path.parent.parent.name == "sboms"
+    ):
+        version = sbom_path.name.removeprefix("sbom-").removesuffix(".cdx.json")
+        return (
+            sbom_path.parent.parent.parent
+            / "advisories"
+            / sbom_path.parent.name
+            / f"osv-{version}.json"
+        )
     if sbom_path.parent.name == "sboms":
         stem = sbom_path.name.removesuffix(".cdx.json")
         return sbom_path.parent.parent / "advisories" / f"{stem}.osv.json"
     return sbom_path.with_suffix(".osv.json")
+
+
+def versioned_output_path(sbom_path: Path, advisory: dict[str, Any]) -> Path:
+    correlation_hash = advisory_content_hash(advisory)
+    if (
+        sbom_path.name.startswith("sbom-")
+        and sbom_path.name.endswith(".cdx.json")
+        and sbom_path.parent.parent.name == "sboms"
+    ):
+        sbom_version = sbom_path.name.removeprefix("sbom-").removesuffix(".cdx.json")
+        return (
+            sbom_path.parent.parent.parent
+            / "advisories"
+            / sbom_path.parent.name
+            / f"osv-{sbom_version}-{correlation_hash}.json"
+        )
+    return default_output_path(sbom_path).with_name(
+        f"{default_output_path(sbom_path).stem}-{correlation_hash}.json"
+    )
+
+
+def write_advisory(advisory: dict[str, Any], out: Path) -> tuple[Path, bool]:
+    if out.exists():
+        LOGGER.info("OSV advisory artifact already exists path=%s", out)
+        return out, False
+    LOGGER.info("writing OSV advisory artifact path=%s", out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(finalized_advisory(advisory), indent=2) + "\n")
+    return out, True
+
+
+def advisory_channel_root(advisory_path: Path) -> Path:
+    if advisory_path.parent.parent.name == "advisories":
+        return advisory_path.parent.parent.parent.parent
+    if advisory_path.parent.name == "advisories":
+        return advisory_path.parent.parent.parent
+    return advisory_path.parent
 
 
 def main() -> None:
@@ -244,20 +495,71 @@ def main() -> None:
         default=DEFAULT_OSV_BATCH_URL,
         help="OSV querybatch endpoint",
     )
+    add_s3_args(parser)
+    add_logging_args(parser, command_name="osv-correlate")
     args = parser.parse_args()
+    log_path = configure_logging(
+        command_name="osv-correlate",
+        log_level=args.log_level,
+        log_file=args.log_file,
+    )
+    LOGGER.info(
+        "starting OSV correlation sbom=%s api_url=%s s3_uri=%s s3_dry_run=%s "
+        "cleanup_uploaded=%s",
+        args.sbom,
+        args.api_url,
+        args.s3_uri,
+        args.s3_dry_run,
+        args.cleanup_uploaded,
+    )
 
     try:
+        if args.out and args.s3_uri:
+            raise OsvError("--s3-uri cannot be used together with --out")
         sbom = _load_json_path(args.sbom)
         advisory = correlate_sbom(
             sbom, source_sbom=str(args.sbom), api_url=args.api_url
         )
-        out = args.out or default_output_path(args.sbom)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(advisory, indent=2) + "\n")
-    except OsvError as exc:
+        if args.out:
+            out = args.out
+            out.parent.mkdir(parents=True, exist_ok=True)
+            LOGGER.info("writing explicit OSV advisory path=%s", out)
+            out.write_text(json.dumps(finalized_advisory(advisory), indent=2) + "\n")
+            status = "wrote explicit OSV advisory"
+        else:
+            out, created = write_advisory(
+                advisory, versioned_output_path(args.sbom, advisory)
+            )
+            status = (
+                "generated new OSV advisory"
+                if created
+                else "OSV advisory version already exists"
+            )
+        if args.s3_uri:
+            LOGGER.info("publishing OSV advisory to S3 path=%s", out)
+            summary = upload_files(
+                local_paths=[out],
+                root=advisory_channel_root(out),
+                s3_uri=args.s3_uri,
+                profile=args.s3_profile,
+                region=args.s3_region,
+                dry_run=args.s3_dry_run,
+                workers=args.s3_workers,
+            )
+            print_s3_summary(summary, dry_run=args.s3_dry_run)
+            if args.cleanup_uploaded and not args.s3_dry_run:
+                print_cleanup_summary(
+                    cleanup_uploaded_files(summary, root=advisory_channel_root(out))
+                )
+    except (OsvError, S3PublishError) as exc:
+        LOGGER.error("OSV correlation failed error=%s", exc)
         print(f"error: {exc}", file=sys.stderr)
+        print_log_location(log_path)
         sys.exit(2)
 
+    LOGGER.info("completed OSV correlation status=%s output=%s", status, out)
+    print(status, file=sys.stderr)
+    print_log_location(log_path)
     print(out)
 
 

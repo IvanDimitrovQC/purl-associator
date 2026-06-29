@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts.load_progress import ProgressTracker
+from scripts.refresh_osv import (
+    collect_queryable_purls,
+    filter_s3_sbom_artifact_paths,
+    load_s3_osv_inventory,
+    refresh_osv,
+    stage_s3_sboms,
+)
+from scripts.s3_publish import paths_present_in_inventory
+
+
+class RefreshOsvTests(unittest.TestCase):
+    def _sbom(self) -> dict:
+        return {
+            "bomFormat": "CycloneDX",
+            "metadata": {
+                "component": {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "purl": "pkg:conda/conda-forge/demo@1.2.3?subdir=noarch",
+                    "bom-ref": "pkg:conda/conda-forge/demo@1.2.3?subdir=noarch",
+                }
+            },
+            "components": [
+                {
+                    "name": "demo-pkg",
+                    "version": "1.2.3",
+                    "purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "bom-ref": "pkg:pypi/demo-pkg@1.2.3",
+                },
+                {
+                    "name": "demo-pkg-duplicate",
+                    "version": "1.2.3",
+                    "purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "bom-ref": "pkg:pypi/demo-pkg@1.2.3",
+                },
+            ],
+        }
+
+    def test_collect_queryable_purls_deduplicates_across_sboms(self) -> None:
+        self.assertEqual(
+            collect_queryable_purls([self._sbom(), self._sbom()]),
+            ["pkg:pypi/demo-pkg@1.2.3"],
+        )
+
+    def test_refresh_osv_writes_only_new_advisory_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local-advisory-channel"
+            sbom_path = (
+                root
+                / "noarch"
+                / "sboms"
+                / "demo-1.2.3-py_0.conda"
+                / "sbom-v1-abc123def456.cdx.json"
+            )
+            sbom_path.parent.mkdir(parents=True)
+            sbom_path.write_text(json.dumps(self._sbom()) + "\n")
+            osv_results = {
+                "pkg:pypi/demo-pkg@1.2.3": [
+                    {"id": "GHSA-demo-0001", "modified": "2026-01-01T00:00:00Z"}
+                ]
+            }
+            published: list[Path] = []
+            progress = ProgressTracker(
+                path=Path(tmp) / "progress.json",
+                load_type="osv-refresh",
+            )
+
+            with patch(
+                "scripts.refresh_osv.query_osv_chunked", return_value=osv_results
+            ):
+                first = refresh_osv(
+                    channel_root=root,
+                    batch_size=10,
+                    workers=2,
+                    progress=progress,
+                    on_output=published.append,
+                )
+                second = refresh_osv(channel_root=root, batch_size=10)
+            progress_data = json.loads((Path(tmp) / "progress.json").read_text())
+
+        self.assertEqual(first.scanned, 1)
+        self.assertEqual(first.queried_purls, 1)
+        self.assertEqual(first.written, 1)
+        self.assertEqual(first.existing, 0)
+        self.assertEqual(second.written, 0)
+        self.assertEqual(second.existing, 1)
+        self.assertTrue(first.outputs[0].name.startswith("osv-v1-abc123def456-"))
+        self.assertEqual(published, first.outputs)
+        self.assertEqual(progress_data["counts"]["processed"], 1)
+
+    def test_s3_osv_inventory_matches_channel_relative_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local-advisory-channel"
+            advisory_path = (
+                root
+                / "noarch"
+                / "advisories"
+                / "demo-1.2.3-py_0.conda"
+                / "osv-v1-abc123def456-fedcba654321.json"
+            )
+            inventory_path = Path(tmp) / "inventory.json"
+            inventory_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "objects": [
+                            (
+                                "noarch/advisories/demo-1.2.3-py_0.conda/"
+                                "osv-v1-abc123def456-fedcba654321.json"
+                            )
+                        ],
+                    }
+                )
+                + "\n"
+            )
+
+            inventory = load_s3_osv_inventory(inventory_path)
+            self.assertTrue(
+                paths_present_in_inventory(
+                    [advisory_path],
+                    root=root,
+                    inventory=inventory,
+                )
+            )
+
+    def test_filter_s3_sbom_artifact_paths_excludes_events_and_indexes(self) -> None:
+        self.assertEqual(
+            filter_s3_sbom_artifact_paths(
+                [
+                    "noarch/sboms/demo/sbom-v1-abc.cdx.json",
+                    "noarch/sboms/demo/event-v1-abc.json",
+                    "noarch/advisory-repodata.json",
+                    "channel-index.json",
+                ]
+            ),
+            ["noarch/sboms/demo/sbom-v1-abc.cdx.json"],
+        )
+
+    def test_stage_s3_sboms_downloads_filtered_objects(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(
+            cmd: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            if "list-objects-v2" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    json.dumps(
+                        {
+                            "Contents": [
+                                {
+                                    "Key": (
+                                        "prefix/noarch/sboms/demo/sbom-v1-abc.cdx.json"
+                                    )
+                                },
+                                {"Key": ("prefix/noarch/sboms/demo/event-v1-abc.json")},
+                            ]
+                        }
+                    ),
+                    "",
+                )
+            if "cp" in cmd:
+                target = Path(cmd[cmd.index("cp") + 2])
+                target.write_text(json.dumps(self._sbom()) + "\n")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "unexpected command")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stage_root = Path(tmp) / "stage"
+            staged = stage_s3_sboms(
+                s3_uri="s3://demo-bucket/prefix",
+                stage_root=stage_root,
+                workers=1,
+                runner=runner,
+            )
+
+            self.assertEqual(
+                staged,
+                [stage_root / "noarch" / "sboms" / "demo" / "sbom-v1-abc.cdx.json"],
+            )
+            self.assertTrue(staged[0].exists())
+
+        self.assertEqual(sum(1 for call in calls if "list-objects-v2" in call), 1)
+        self.assertEqual(sum(1 for call in calls if "cp" in call), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

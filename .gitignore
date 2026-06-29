@@ -19,6 +19,7 @@ osv_cache/
 nvd_cache/
 
 # Local scratch outputs
+.cache/
 .tmp/
 local-advisory-channel/
 

@@ -28,7 +28,13 @@ python = ">=3.13,<3.14"
 "mappings:merge" = "python -m scripts.merge_mappings"
 "mappings:validate" = "python -m scripts.validate"
 "sbom:generate" = "python -m scripts.generate_sbom"
+"sbom:generate-many" = "python -m scripts.generate_sboms"
+"sbom:refresh" = "python -m scripts.generate_sboms mappings/auto.json --cache-dir .cache/repodata"
+"sbom:s3-inventory" = "python -m scripts.s3_sbom_inventory"
 "osv:correlate" = "python -m scripts.correlate_osv"
+"osv:refresh" = "python -m scripts.refresh_osv"
+"osv:s3-inventory" = "python -m scripts.s3_osv_inventory"
+"advisory:index" = "python -m scripts.advisory_index"
 "sbom:test" = "python -m unittest discover -s tests"
 
 [environments]

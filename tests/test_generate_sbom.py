@@ -9,7 +9,13 @@ from scripts.generate_sbom import (
     add_version_to_purl,
     build_cyclonedx_sbom,
     generate_sbom,
+    generate_sbom_from_mapping,
+    get_sbom_version,
     load_mapping_entry,
+    load_mapping_entry_file,
+    sbom_event_path,
+    sbom_output_path,
+    write_versioned_sbom,
 )
 
 
@@ -122,6 +128,141 @@ class GenerateSbomTests(unittest.TestCase):
             sbom["dependencies"][0]["dependsOn"],
             ["pkg:pypi/demo-pkg@1.2.3"],
         )
+        self.assertRegex(get_sbom_version(sbom), r"^v1-[0-9a-f]{12}$")
+
+    def test_generate_sbom_from_mapping_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _index_path, _payload_path = self._write_demo_mapping(root)
+            repodata_path = self._write_demo_repodata(root)
+            entry_path = root / "entry.json"
+            entry_path.write_text(
+                json.dumps(
+                    {
+                        "name": "demo",
+                        "version": "1.2.3",
+                        "build": "py_0",
+                        "subdir": "noarch",
+                        "url": (
+                            "https://conda.anaconda.org/conda-forge/noarch/"
+                            "demo-1.2.3-py_0.conda"
+                        ),
+                        "purl": "pkg:pypi/demo-pkg",
+                        "type": "pypi",
+                        "pkg_name": "demo-pkg",
+                    }
+                )
+                + "\n"
+            )
+
+            filename, subdir, sbom = generate_sbom_from_mapping(
+                load_mapping_entry_file(entry_path),
+                version=None,
+                build=None,
+                subdir=None,
+                filename=None,
+                channel="conda-forge",
+                repodata_ref=str(repodata_path),
+                purl_type_filter="pypi",
+            )
+
+        self.assertEqual(filename, "demo-1.2.3-py_0.conda")
+        self.assertEqual(subdir, "noarch")
+        self.assertEqual(sbom["components"][0]["purl"], "pkg:pypi/demo-pkg@1.2.3")
+
+    def test_write_versioned_sbom_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index_path, payload_path = self._write_demo_mapping(root)
+            repodata_path = self._write_demo_repodata(root)
+            filename, subdir, sbom = generate_sbom(
+                package="demo",
+                version=None,
+                build=None,
+                subdir=None,
+                filename=None,
+                channel="conda-forge",
+                repodata_ref=str(repodata_path),
+                mapping_index=index_path,
+                mapping_payload=payload_path,
+                purl_type_filter="pypi",
+            )
+
+            first_path, first_created = write_versioned_sbom(
+                sbom=sbom, root=root / "channel", subdir=subdir, filename=filename
+            )
+            second_path, second_created = write_versioned_sbom(
+                sbom=sbom, root=root / "channel", subdir=subdir, filename=filename
+            )
+            version = get_sbom_version(sbom)
+            expected_sbom_path = sbom_output_path(
+                root / "channel",
+                subdir="noarch",
+                filename="demo-1.2.3-py_0.conda",
+                version=version,
+            )
+            expected_event_path = sbom_event_path(
+                root / "channel",
+                subdir="noarch",
+                filename="demo-1.2.3-py_0.conda",
+                version=version,
+            )
+
+            self.assertEqual(first_path, second_path)
+            self.assertTrue(first_created)
+            self.assertFalse(second_created)
+            self.assertEqual(first_path, expected_sbom_path)
+            self.assertTrue(expected_event_path.exists())
+
+    def test_sbom_version_tracks_only_significant_content(self) -> None:
+        record = {
+            "name": "demo",
+            "version": "1.2.3",
+            "build": "py_0",
+            "build_number": 0,
+            "sha256": "a" * 64,
+            "license": "MIT",
+        }
+        mapping = {
+            "name": "demo",
+            "version": "1.2.3",
+            "build": "py_0",
+            "subdir": "noarch",
+            "purl": "pkg:pypi/demo-pkg",
+            "pkg_name": "demo-pkg",
+            "download_count": 1,
+        }
+
+        first = build_cyclonedx_sbom(
+            mapping=mapping,
+            record=record,
+            filename="demo-1.2.3-py_0.conda",
+            channel="conda-forge",
+            subdir="noarch",
+        )
+        insignificant_change = {
+            **mapping,
+            "download_count": 2,
+            "summary": "updated package description",
+        }
+        second = build_cyclonedx_sbom(
+            mapping=insignificant_change,
+            record=record,
+            filename="demo-1.2.3-py_0.conda",
+            channel="conda-forge",
+            subdir="noarch",
+        )
+        purl_change = {**mapping, "purl": "pkg:pypi/renamed-demo-pkg"}
+        third = build_cyclonedx_sbom(
+            mapping=purl_change,
+            record=record,
+            filename="demo-1.2.3-py_0.conda",
+            channel="conda-forge",
+            subdir="noarch",
+        )
+
+        self.assertEqual(get_sbom_version(first), get_sbom_version(second))
+        self.assertNotEqual(get_sbom_version(first), get_sbom_version(third))
 
     def test_add_version_to_purl_preserves_qualifiers_and_subpath(self) -> None:
         self.assertEqual(
