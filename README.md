@@ -199,6 +199,23 @@ the command with unchanged mapping and repodata content reports existing SBOM
 versions instead of writing duplicates. Repodata fetches use conditional cache
 headers when available and retry transient `429`/`5xx` responses with backoff.
 
+To generate SBOMs for historical package versions, ask the refresh command to
+fan out each mapped package over the latest N distinct conda versions found in
+repodata:
+
+```sh
+pixi run -e lite sbom:refresh --versions-per-package 10
+```
+
+This still treats `mappings/auto.json` as the package identity source. The
+unversioned mapped PURL is combined with each selected conda artifact version
+when the SBOM is written, for example `pkg:pypi/numpy` becomes
+`pkg:pypi/numpy@2.1.3`. By default historical selection scans the subdir stored
+in the mapping and writes the latest build for each selected version. To scan
+the full conda-forge platform matrix instead, use `--artifact-subdirs all`.
+Use `--artifact-selection all-builds` only when every historical build is needed;
+it creates many more artifacts.
+
 The SBOM subject is the conda artifact (`metadata.component`). The mapped PyPI
 PURL is emitted as a CycloneDX component with the artifact version added, so a
 later OSV correlator can read component PURLs directly.
@@ -220,7 +237,8 @@ local-advisory-channel/<subdir>/advisories/<filename>/
 
 That sidecar contains the SBOM subject, the queried components, skipped
 unversioned PURLs, and flattened vulnerability findings for a future advisory
-channel index.
+channel index. OSV advisory artifact schema version 2 also stores a canonical
+`https://osv.dev/vulnerability/<id>` URL for each vulnerability finding.
 
 For periodic OSV maintenance, refresh all locally available SBOMs in one
 deduplicated pass:
@@ -305,16 +323,38 @@ pixi run -e lite sbom:refresh \
   --s3-profile <profile> \
   --s3-region <region> \
   --s3-sbom-inventory .tmp/s3-sbom-inventory.json \
+  --skip-existing-s3-sboms \
+  --versions-per-package 10 \
   --progress-file .tmp/sbom-refresh-progress.json \
   --update-index \
   --cleanup-uploaded
 ```
 
 This is a resume-time optimization: the refresh still builds each candidate
-SBOM locally so it can compute the content-addressed path and update indexes,
-but when both the SBOM and event paths are listed in the inventory, it skips the
-per-object S3 existence checks/uploads and removes the local temp files when
-`--cleanup-uploaded` is set.
+SBOM locally so it can compute the content-addressed path and update indexes.
+When `--skip-existing-s3-sboms` is also set, historical SBOM refreshes can
+compute the exact expected SBOM/event paths from repodata and the mapping first;
+if both paths are listed in the inventory, local SBOM generation is skipped
+entirely for that artifact. Otherwise, when both the SBOM and event paths are
+listed in the inventory, it skips the per-object S3 existence checks/uploads and
+removes the local temp files when `--cleanup-uploaded` is set.
+
+To write a lightweight local summary of the SBOM state in S3, reuse the same
+inventory:
+
+```sh
+pixi run -e lite sbom:summary \
+  --s3-uri s3://<bucket>/<prefix> \
+  --s3-profile <profile> \
+  --s3-region <region> \
+  --s3-sbom-inventory .tmp/s3-sbom-inventory.json \
+  --out .tmp/sbom-summary.json
+```
+
+The summary counts SBOM files, event files, complete SBOM/event pairs, missing
+events, subdirs, packages, and package versions without downloading every SBOM
+JSON. It derives package/version/build from the conda artifact filename. Pass
+`--include-artifacts` if you also want per-artifact rows in the output.
 
 OSV advisory artifacts support the same S3 publication pattern. Because OSV
 artifacts are derived from a specific SBOM version and current OSV response
@@ -353,6 +393,49 @@ OSV inventory is still only used after the exact advisory output path is known;
 if OSV data has changed, the new hash produces a new path and the artifact is
 uploaded. S3-sourced SBOMs are staged under `.tmp/osv-sbom-stage/` by default
 and removed after a successful run unless `--keep-s3-sbom-stage` is set.
+
+To create a lightweight local package-to-vulnerabilities summary from the OSV
+artifacts already in S3, run:
+
+```sh
+pixi run -e lite osv:vulnerability-summary \
+  --s3-uri s3://<bucket>/<prefix> \
+  --s3-profile <profile> \
+  --s3-region <region> \
+  --s3-osv-inventory .tmp/s3-osv-inventory.json \
+  --out .tmp/osv-vulnerability-summary.json \
+  --workers 8
+```
+
+The summary script streams advisory JSON from S3 directly into memory and writes
+only the local output file. By default it reports the latest advisory artifact
+per source SBOM, which avoids including superseded append-only OSV results. Pass
+`--include-all-artifacts` to aggregate every OSV artifact version, or
+`--only-vulnerable` to omit packages with empty vulnerability lists. Vulnerability
+rows include OSV IDs, component PURLs, and canonical OSV URLs; URLs are derived
+from the ID when reading older schema version 1 advisory artifacts. Summary
+payloads with vulnerability URLs use schema version 2.
+
+To build the static data file consumed by the local dashboard, merge the S3
+advisory indexes, the PURL mapping, and the local OSV vulnerability summary:
+
+```sh
+pixi run -e lite advisory:dashboard-data \
+  --s3-uri s3://<bucket>/<prefix> \
+  --s3-profile <profile> \
+  --s3-region <region> \
+  --mapping-json mappings/auto.json \
+  --osv-summary .tmp/osv-vulnerability-summary.json \
+  --out web/public/advisory-dashboard-data.json \
+  --workers 8
+```
+
+The dashboard payload includes package-level flags such as `missing_purl`,
+`has_sbom`, `missing_osv`, `vulnerabilities_found`,
+`no_known_vulnerabilities`, and latest-indexed-version flags. It also keeps the
+artifact rows needed to drill down by version, platform subdir, and build. When
+OSV findings are present, their IDs link to the corresponding OSV page. Dashboard
+payloads with vulnerability URLs use schema version 2.
 
 S3 keys preserve the local channel-relative path. For example:
 

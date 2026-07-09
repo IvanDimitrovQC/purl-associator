@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
@@ -35,6 +36,8 @@ DEFAULT_OSV_BATCH_SIZE = 250
 DEFAULT_OSV_RETRIES = 3
 DEFAULT_OSV_RETRY_DELAY_SECONDS = 1.0
 ADVISORY_VERSION_PREFIX = "v1"
+OSV_ADVISORY_SCHEMA_VERSION = 2
+OSV_VULNERABILITY_URL_BASE = "https://osv.dev/vulnerability"
 LOGGER = logging.getLogger("scripts.correlate_osv")
 
 
@@ -312,6 +315,20 @@ def _subject(sbom: dict[str, Any]) -> dict[str, Any] | None:
     return _component_identity(component)
 
 
+def osv_vulnerability_url(vulnerability_id: str) -> str:
+    return f"{OSV_VULNERABILITY_URL_BASE}/{quote(vulnerability_id, safe='')}"
+
+
+def _vulnerability_with_url(vulnerability: dict[str, Any]) -> dict[str, Any]:
+    vuln_id = vulnerability.get("id")
+    if not isinstance(vuln_id, str):
+        return vulnerability
+    return {
+        **vulnerability,
+        "url": vulnerability.get("url") or osv_vulnerability_url(vuln_id),
+    }
+
+
 def _flatten_findings(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for component in components:
@@ -327,6 +344,7 @@ def _flatten_findings(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "component_name": component.get("name"),
                     "component_version": component.get("version"),
                     "vulnerability_id": vuln_id,
+                    "url": vuln.get("url") or osv_vulnerability_url(vuln_id),
                     "modified": vuln.get("modified"),
                 }
             )
@@ -358,7 +376,11 @@ def correlate_sbom_with_results(
     correlated: list[dict[str, Any]] = []
     for component in queryable:
         purl = str(component["purl"])
-        vulnerabilities = osv_results.get(purl, [])
+        vulnerabilities = [
+            _vulnerability_with_url(vulnerability)
+            for vulnerability in osv_results.get(purl, [])
+            if isinstance(vulnerability, dict)
+        ]
         correlated.append(
             {
                 **component,
@@ -369,7 +391,7 @@ def correlate_sbom_with_results(
 
     findings = _flatten_findings(correlated)
     return {
-        "schema_version": 1,
+        "schema_version": OSV_ADVISORY_SCHEMA_VERSION,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "source": {
             "name": "osv.dev",

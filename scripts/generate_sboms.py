@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import random
+import re
 import sys
 import threading
 import time
@@ -25,8 +26,11 @@ from scripts.generate_sbom import (
     DEFAULT_MAPPING_PAYLOAD,
     SbomError,
     _default_repodata_url,
+    _iter_repodata_records,
     _load_json_path,
     _load_json_ref,
+    expected_sbom_artifact_paths,
+    generate_sbom_from_record,
     generate_sbom_from_mapping,
     purl_type,
     sbom_artifact_paths,
@@ -47,6 +51,18 @@ DEFAULT_REPODATA_CACHE = Path(".cache") / "repodata"
 DEFAULT_REPODATA_CACHE_SECONDS = 1200
 DEFAULT_REPODATA_RETRIES = 3
 DEFAULT_REPODATA_RETRY_DELAY_SECONDS = 1.0
+DEFAULT_ARTIFACT_SUBDIRS = (
+    "noarch",
+    "linux-64",
+    "linux-aarch64",
+    "linux-ppc64le",
+    "osx-64",
+    "osx-arm64",
+    "win-64",
+    "win-32",
+)
+ARTIFACT_SELECTION_LATEST = "latest-build-per-version-per-subdir"
+ARTIFACT_SELECTION_ALL_BUILDS = "all-builds"
 LOGGER = logging.getLogger("scripts.generate_sboms")
 
 
@@ -56,6 +72,7 @@ class BatchResult:
     existing: int
     skipped: int
     errors: list[str]
+    inventory_skipped: int = 0
 
 
 @dataclass(frozen=True)
@@ -66,9 +83,21 @@ class GeneratedSbom:
     filename: str
     path: Path
     created: bool
+    inventory_skipped: bool = False
+
+
+@dataclass(frozen=True)
+class SbomWorkItem:
+    index: int
+    name: str
+    mapping: dict[str, Any]
+    subdir: str
+    filename: str | None = None
+    record: dict[str, Any] | None = None
 
 
 ArtifactHandler = Callable[[list[Path]], None]
+ArtifactSkipPredicate = Callable[[list[Path]], bool]
 
 
 def load_s3_sbom_inventory(path: Path) -> set[str]:
@@ -361,6 +390,168 @@ def _validate_workers(value: int, *, option: str) -> None:
         raise SbomError(f"{option} must be at least 1")
 
 
+def _validate_versions_per_package(value: int | None) -> None:
+    if value is not None and value < 1:
+        raise SbomError("--versions-per-package must be at least 1")
+
+
+def _version_sort_key(version: str) -> tuple[tuple[int, int | str], ...]:
+    parts: list[tuple[int, int | str]] = []
+    for part in re.split(r"([0-9]+)", version):
+        if not part:
+            continue
+        if part.isdigit():
+            parts.append((1, int(part)))
+        else:
+            parts.append((0, part.lower()))
+    return tuple(parts)
+
+
+def _numeric_timestamp(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _filename_format_priority(filename: str) -> int:
+    return 1 if filename.endswith(".conda") else 0
+
+
+def _record_sort_key(
+    filename: str, record: dict[str, Any]
+) -> tuple[int, float, int, str]:
+    build_number = record.get("build_number")
+    if not isinstance(build_number, int):
+        build_number = -1
+    return (
+        build_number,
+        _numeric_timestamp(record.get("timestamp")),
+        _filename_format_priority(filename),
+        str(record.get("build") or ""),
+    )
+
+
+def _records_by_package(repodata: dict[str, Any]) -> dict[str, list[tuple[str, dict]]]:
+    by_name: dict[str, list[tuple[str, dict]]] = {}
+    for filename, record in _iter_repodata_records(repodata):
+        name = record.get("name")
+        if isinstance(name, str):
+            by_name.setdefault(name, []).append((filename, record))
+    return by_name
+
+
+def _resolve_artifact_subdirs(mapping: dict[str, Any], value: str) -> list[str]:
+    cleaned = value.strip()
+    if cleaned == "mapped":
+        subdir = mapping.get("subdir")
+        if not isinstance(subdir, str) or not subdir:
+            raise SbomError("mapping entry is missing subdir")
+        return [subdir]
+    if cleaned == "all":
+        return list(DEFAULT_ARTIFACT_SUBDIRS)
+    subdirs = [part.strip() for part in cleaned.split(",") if part.strip()]
+    if not subdirs:
+        raise SbomError("--artifact-subdirs must be 'mapped', 'all', or a list")
+    return list(dict.fromkeys(subdirs))
+
+
+def _validate_artifact_selection(value: str) -> None:
+    if value not in {ARTIFACT_SELECTION_LATEST, ARTIFACT_SELECTION_ALL_BUILDS}:
+        raise SbomError(
+            "--artifact-selection must be "
+            f"{ARTIFACT_SELECTION_LATEST!r} or {ARTIFACT_SELECTION_ALL_BUILDS!r}"
+        )
+
+
+def select_package_artifacts(
+    *,
+    name: str,
+    mapping: dict[str, Any],
+    records_for_package: Callable[[str, str], list[tuple[str, dict]]],
+    versions_per_package: int,
+    artifact_subdirs: str,
+    artifact_selection: str,
+) -> list[SbomWorkItem]:
+    _validate_artifact_selection(artifact_selection)
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    for subdir in _resolve_artifact_subdirs(mapping, artifact_subdirs):
+        for filename, record in records_for_package(subdir, name):
+            version = record.get("version")
+            if isinstance(version, str) and version:
+                candidates.append((subdir, filename, dict(record)))
+
+    if not candidates:
+        return []
+
+    versions = sorted(
+        {str(record["version"]) for _subdir, _filename, record in candidates},
+        key=_version_sort_key,
+        reverse=True,
+    )[:versions_per_package]
+    selected_versions = set(versions)
+    candidates = [
+        candidate
+        for candidate in candidates
+        if str(candidate[2].get("version")) in selected_versions
+    ]
+
+    if artifact_selection == ARTIFACT_SELECTION_ALL_BUILDS:
+        # `repodata.json` can contain both `.conda` and legacy `.tar.bz2`
+        # variants for the same conda build. Keep the preferred package format
+        # for each equivalent build to avoid duplicate SBOMs for one build.
+        by_build: dict[tuple[str, str, str, int | None], tuple[str, str, dict]] = {}
+        for subdir, filename, record in candidates:
+            key = (
+                subdir,
+                str(record.get("version") or ""),
+                str(record.get("build") or ""),
+                record.get("build_number")
+                if isinstance(record.get("build_number"), int)
+                else None,
+            )
+            prior = by_build.get(key)
+            if prior is None or _record_sort_key(filename, record) > _record_sort_key(
+                prior[1], prior[2]
+            ):
+                by_build[key] = (subdir, filename, record)
+        selected = list(by_build.values())
+    else:
+        by_version_subdir: dict[tuple[str, str], tuple[str, str, dict]] = {}
+        for subdir, filename, record in candidates:
+            key = (str(record.get("version") or ""), subdir)
+            prior = by_version_subdir.get(key)
+            if prior is None or _record_sort_key(filename, record) > _record_sort_key(
+                prior[1], prior[2]
+            ):
+                by_version_subdir[key] = (subdir, filename, record)
+        selected = list(by_version_subdir.values())
+
+    selected.sort(
+        key=lambda item: (
+            _version_sort_key(str(item[2].get("version") or "")),
+            item[0],
+            _record_sort_key(item[1], item[2]),
+        ),
+        reverse=True,
+    )
+    return [
+        SbomWorkItem(
+            index=0,
+            name=name,
+            mapping=mapping,
+            subdir=subdir,
+            filename=filename,
+            record=record,
+        )
+        for subdir, filename, record in selected
+    ]
+
+
 def generate_many(
     entries: list[tuple[str, dict[str, Any]]],
     *,
@@ -377,9 +568,15 @@ def generate_many(
     workers: int = 1,
     progress: ProgressTracker | None = None,
     on_artifacts: ArtifactHandler | None = None,
+    versions_per_package: int | None = None,
+    artifact_subdirs: str = "mapped",
+    artifact_selection: str = ARTIFACT_SELECTION_LATEST,
+    skip_artifacts: ArtifactSkipPredicate | None = None,
 ) -> BatchResult:
     _validate_workers(workers, option="--workers")
-    selected, skipped, skip_reasons = _select_entries(
+    _validate_versions_per_package(versions_per_package)
+    _validate_artifact_selection(artifact_selection)
+    selected_mappings, skipped, skip_reasons = _select_entries(
         entries,
         purl_type_filter=purl_type_filter,
         random_one=random_one,
@@ -389,39 +586,13 @@ def generate_many(
 
     generated: list[Path] = []
     existing = 0
+    inventory_skipped = 0
     errors: list[str] = []
     repodata_cache: dict[str, dict[str, Any]] = {}
+    repodata_index_cache: dict[str, dict[str, list[tuple[str, dict]]]] = {}
     repodata_lock = threading.Lock()
     processed = 0
     new_count = 0
-
-    if progress:
-        progress.update(
-            totals={
-                "selected": len(selected),
-                "skipped_ineligible": skipped,
-            },
-            counts={
-                "processed": 0,
-                "new_sboms": 0,
-                "existing_sboms": 0,
-                "errors": 0,
-                "workers": workers,
-            },
-        )
-    LOGGER.info(
-        "SBOM selection complete total_mappings=%d selected=%d skipped=%d "
-        "skip_reasons=%s random=%s seed=%s limit=%s purl_type=%s workers=%d",
-        len(entries),
-        len(selected),
-        skipped,
-        skip_reasons,
-        random_one,
-        seed,
-        limit,
-        purl_type_filter,
-        workers,
-    )
 
     def repodata_for_subdir(subdir: str) -> dict[str, Any]:
         with repodata_lock:
@@ -436,61 +607,71 @@ def generate_many(
                 )
             return repodata_cache[subdir]
 
-    def process_entry(index: int, name: str, mapping: dict[str, Any]) -> GeneratedSbom:
-        subdir = str(mapping["subdir"])
-        LOGGER.info(
-            "generating SBOM package=%s subdir=%s index=%d total=%d purl=%s",
-            name,
-            subdir,
-            index,
-            len(selected),
-            mapping.get("purl"),
-        )
-        filename, selected_subdir, sbom = generate_sbom_from_mapping(
-            mapping,
-            version=None,
-            build=None,
-            subdir=None,
-            filename=None,
-            channel=channel,
-            repodata_ref=None,
-            purl_type_filter=purl_type_filter,
-            repodata=repodata_for_subdir(subdir),
-        )
-        out, created = write_versioned_sbom(
-            sbom=sbom,
-            root=out_dir,
-            subdir=selected_subdir,
-            filename=filename,
-        )
-        LOGGER.info(
-            "SBOM package complete package=%s filename=%s path=%s created=%s",
-            name,
-            filename,
-            out,
-            created,
-        )
-        if on_artifacts:
-            LOGGER.info(
-                "handling generated SBOM artifacts package=%s path=%s",
-                name,
-                out,
-            )
-            on_artifacts(sbom_artifact_paths(out))
-        return GeneratedSbom(
-            index=index,
-            name=name,
-            subdir=selected_subdir,
-            filename=filename,
-            path=out,
-            created=created,
-        )
+    def records_for_package(subdir: str, name: str) -> list[tuple[str, dict]]:
+        with repodata_lock:
+            if subdir not in repodata_index_cache:
+                if subdir not in repodata_cache:
+                    LOGGER.info("loading repodata for SBOM batch subdir=%s", subdir)
+                    repodata_cache[subdir] = load_repodata(
+                        channel=channel,
+                        subdir=subdir,
+                        cache_dir=repodata_cache_dir,
+                        cache_max_age_seconds=cache_max_age_seconds,
+                        refresh_cache=refresh_cache,
+                    )
+                LOGGER.info("indexing repodata for SBOM batch subdir=%s", subdir)
+                repodata_index_cache[subdir] = _records_by_package(
+                    repodata_cache[subdir]
+                )
+            return [
+                (filename, dict(record))
+                for filename, record in repodata_index_cache[subdir].get(name, [])
+            ]
 
-    def record_success(result: GeneratedSbom) -> None:
-        nonlocal existing, new_count
-        generated.append(result.path)
-        existing += 0 if result.created else 1
-        new_count += 1 if result.created else 0
+    def make_work_items() -> list[SbomWorkItem]:
+        if versions_per_package is None:
+            return [
+                SbomWorkItem(
+                    index=index,
+                    name=name,
+                    mapping=mapping,
+                    subdir=str(mapping["subdir"]),
+                )
+                for index, (name, mapping) in enumerate(selected_mappings, start=1)
+            ]
+
+        work: list[SbomWorkItem] = []
+        for name, mapping in selected_mappings:
+            try:
+                artifacts = select_package_artifacts(
+                    name=name,
+                    mapping=mapping,
+                    records_for_package=records_for_package,
+                    versions_per_package=versions_per_package,
+                    artifact_subdirs=artifact_subdirs,
+                    artifact_selection=artifact_selection,
+                )
+                if not artifacts:
+                    raise SbomError(
+                        "no repodata records matched historical version selection"
+                    )
+                work.extend(artifacts)
+            except SbomError as exc:
+                record_error(name, str(mapping.get("subdir") or "?"), exc)
+                if fail_fast:
+                    raise SbomError(f"{name}: {exc}") from exc
+
+        return [
+            SbomWorkItem(
+                index=index,
+                name=item.name,
+                mapping=item.mapping,
+                subdir=item.subdir,
+                filename=item.filename,
+                record=item.record,
+            )
+            for index, item in enumerate(work, start=1)
+        ]
 
     def record_error(name: str, subdir: str, exc: SbomError) -> None:
         message = f"{name}: {exc}"
@@ -502,12 +683,147 @@ def generate_many(
             exc,
         )
 
+    work_items = make_work_items()
+
+    if progress:
+        progress.update(
+            totals={
+                "selected": len(work_items),
+                "selected_mappings": len(selected_mappings),
+                "skipped_ineligible": skipped,
+            },
+            counts={
+                "processed": 0,
+                "new_sboms": 0,
+                "existing_sboms": 0,
+                "inventory_skipped_sboms": 0,
+                "errors": len(errors),
+                "workers": workers,
+            },
+        )
+    LOGGER.info(
+        "SBOM selection complete total_mappings=%d selected_mappings=%d "
+        "selected_artifacts=%d skipped=%d skip_reasons=%s random=%s seed=%s "
+        "limit=%s purl_type=%s workers=%d versions_per_package=%s "
+        "artifact_subdirs=%s artifact_selection=%s",
+        len(entries),
+        len(selected_mappings),
+        len(work_items),
+        skipped,
+        skip_reasons,
+        random_one,
+        seed,
+        limit,
+        purl_type_filter,
+        workers,
+        versions_per_package,
+        artifact_subdirs,
+        artifact_selection,
+    )
+
+    def process_item(item: SbomWorkItem) -> GeneratedSbom:
+        LOGGER.info(
+            "generating SBOM package=%s subdir=%s index=%d total=%d purl=%s "
+            "filename=%s historical=%s",
+            item.name,
+            item.subdir,
+            item.index,
+            len(work_items),
+            item.mapping.get("purl"),
+            item.filename,
+            item.record is not None,
+        )
+        if item.record is not None and item.filename is not None:
+            expected_paths = expected_sbom_artifact_paths(
+                mapping=item.mapping,
+                record=item.record,
+                root=out_dir,
+                subdir=item.subdir,
+                filename=item.filename,
+                channel=channel,
+            )
+            if skip_artifacts is not None and skip_artifacts(expected_paths):
+                LOGGER.info(
+                    "skipping inventory-present SBOM package=%s subdir=%s "
+                    "filename=%s path=%s",
+                    item.name,
+                    item.subdir,
+                    item.filename,
+                    expected_paths[0],
+                )
+                return GeneratedSbom(
+                    index=item.index,
+                    name=item.name,
+                    subdir=item.subdir,
+                    filename=item.filename,
+                    path=expected_paths[0],
+                    created=False,
+                    inventory_skipped=True,
+                )
+            filename, selected_subdir, sbom = generate_sbom_from_record(
+                item.mapping,
+                record=item.record,
+                filename=item.filename,
+                subdir=item.subdir,
+                channel=channel,
+                purl_type_filter=purl_type_filter,
+            )
+        else:
+            filename, selected_subdir, sbom = generate_sbom_from_mapping(
+                item.mapping,
+                version=None,
+                build=None,
+                subdir=None,
+                filename=None,
+                channel=channel,
+                repodata_ref=None,
+                purl_type_filter=purl_type_filter,
+                repodata=repodata_for_subdir(item.subdir),
+            )
+        out, created = write_versioned_sbom(
+            sbom=sbom,
+            root=out_dir,
+            subdir=selected_subdir,
+            filename=filename,
+        )
+        LOGGER.info(
+            "SBOM package complete package=%s filename=%s path=%s created=%s",
+            item.name,
+            filename,
+            out,
+            created,
+        )
+        if on_artifacts:
+            LOGGER.info(
+                "handling generated SBOM artifacts package=%s path=%s",
+                item.name,
+                out,
+            )
+            on_artifacts(sbom_artifact_paths(out))
+        return GeneratedSbom(
+            index=item.index,
+            name=item.name,
+            subdir=selected_subdir,
+            filename=filename,
+            path=out,
+            created=created,
+        )
+
+    def record_success(result: GeneratedSbom) -> None:
+        nonlocal existing, inventory_skipped, new_count
+        if result.inventory_skipped:
+            inventory_skipped += 1
+            return
+        generated.append(result.path)
+        existing += 0 if result.created else 1
+        new_count += 1 if result.created else 0
+
     def update_processed(count: int, name: str, subdir: str) -> None:
         if progress:
             progress.update(
                 current={
                     "index": count,
-                    "total": len(selected),
+                    "total": len(work_items),
                     "package": name,
                     "subdir": subdir,
                 },
@@ -515,52 +831,54 @@ def generate_many(
                     "processed": processed,
                     "new_sboms": new_count,
                     "existing_sboms": existing,
+                    "inventory_skipped_sboms": inventory_skipped,
                     "errors": len(errors),
                 },
             )
 
     if workers == 1:
-        for index, (name, mapping) in enumerate(selected, start=1):
-            subdir = str(mapping["subdir"])
+        for item in work_items:
             try:
-                record_success(process_entry(index, name, mapping))
+                record_success(process_item(item))
             except S3PublishError:
                 raise
             except SbomError as exc:
-                record_error(name, subdir, exc)
+                record_error(item.name, item.subdir, exc)
                 if fail_fast:
-                    raise SbomError(f"{name}: {exc}") from exc
+                    raise SbomError(f"{item.name}: {exc}") from exc
             finally:
                 processed += 1
-                update_processed(processed, name, subdir)
+                update_processed(processed, item.name, item.subdir)
         return BatchResult(
-            generated=generated, existing=existing, skipped=skipped, errors=errors
+            generated=generated,
+            existing=existing,
+            skipped=skipped,
+            errors=errors,
+            inventory_skipped=inventory_skipped,
         )
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(process_entry, index, name, mapping): (
-                name,
-                str(mapping["subdir"]),
-            )
-            for index, (name, mapping) in enumerate(selected, start=1)
-        }
+        futures = {executor.submit(process_item, item): item for item in work_items}
         for future in as_completed(futures):
-            name, subdir = futures[future]
+            item = futures[future]
             try:
                 record_success(future.result())
             except S3PublishError:
                 raise
             except SbomError as exc:
-                record_error(name, subdir, exc)
+                record_error(item.name, item.subdir, exc)
                 if fail_fast:
-                    raise SbomError(f"{name}: {exc}") from exc
+                    raise SbomError(f"{item.name}: {exc}") from exc
             finally:
                 processed += 1
-                update_processed(processed, name, subdir)
+                update_processed(processed, item.name, item.subdir)
 
     return BatchResult(
-        generated=generated, existing=existing, skipped=skipped, errors=errors
+        generated=generated,
+        existing=existing,
+        skipped=skipped,
+        errors=errors,
+        inventory_skipped=inventory_skipped,
     )
 
 
@@ -591,7 +909,33 @@ def main() -> None:
         help="generate one random eligible package from the mapping payload",
     )
     parser.add_argument("--seed", help="seed for --random selection")
-    parser.add_argument("--limit", type=int, help="generate at most N SBOMs")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="process at most N eligible package mappings",
+    )
+    parser.add_argument(
+        "--versions-per-package",
+        type=int,
+        help=(
+            "generate SBOMs for the latest N distinct conda versions per "
+            "eligible package instead of only the mapped artifact"
+        ),
+    )
+    parser.add_argument(
+        "--artifact-subdirs",
+        default="mapped",
+        help=(
+            "subdirs to scan for --versions-per-package: 'mapped', 'all', "
+            "or a comma-separated list"
+        ),
+    )
+    parser.add_argument(
+        "--artifact-selection",
+        choices=[ARTIFACT_SELECTION_LATEST, ARTIFACT_SELECTION_ALL_BUILDS],
+        default=ARTIFACT_SELECTION_LATEST,
+        help="which artifacts to emit for each selected package version",
+    )
     parser.add_argument(
         "--cache-dir",
         type=Path,
@@ -637,6 +981,14 @@ def main() -> None:
             "skip S3 HEAD/PUT checks"
         ),
     )
+    parser.add_argument(
+        "--skip-existing-s3-sboms",
+        action="store_true",
+        help=(
+            "with --s3-sbom-inventory, skip local SBOM generation when the exact "
+            "SBOM and event paths already exist in the inventory"
+        ),
+    )
     add_s3_args(parser)
     add_logging_args(parser, command_name="sbom-refresh")
     args = parser.parse_args()
@@ -648,7 +1000,9 @@ def main() -> None:
     LOGGER.info(
         "starting SBOM refresh mapping_json=%s channel=%s out_dir=%s random=%s "
         "seed=%s limit=%s purl_type=%s cache_dir=%s s3_uri=%s s3_dry_run=%s "
-        "cleanup_uploaded=%s update_index=%s workers=%d s3_workers=%d",
+        "cleanup_uploaded=%s update_index=%s workers=%d s3_workers=%d "
+        "versions_per_package=%s artifact_subdirs=%s artifact_selection=%s "
+        "skip_existing_s3_sboms=%s",
         args.mapping_json,
         args.channel,
         args.out_dir,
@@ -663,6 +1017,10 @@ def main() -> None:
         args.update_index,
         args.workers,
         args.s3_workers,
+        args.versions_per_package,
+        args.artifact_subdirs,
+        args.artifact_selection,
+        args.skip_existing_s3_sboms,
     )
 
     progress = (
@@ -678,6 +1036,10 @@ def main() -> None:
                 "update_index": args.update_index,
                 "workers": args.workers,
                 "s3_workers": args.s3_workers,
+                "versions_per_package": args.versions_per_package,
+                "artifact_subdirs": args.artifact_subdirs,
+                "artifact_selection": args.artifact_selection,
+                "skip_existing_s3_sboms": args.skip_existing_s3_sboms,
                 "s3_sbom_inventory": str(args.s3_sbom_inventory)
                 if args.s3_sbom_inventory
                 else None,
@@ -694,6 +1056,8 @@ def main() -> None:
     try:
         if args.s3_sbom_inventory and not args.s3_uri:
             raise SbomError("--s3-sbom-inventory requires --s3-uri")
+        if args.skip_existing_s3_sboms and not args.s3_sbom_inventory:
+            raise SbomError("--skip-existing-s3-sboms requires --s3-sbom-inventory")
         if args.s3_sbom_inventory:
             s3_inventory = load_s3_sbom_inventory(args.s3_sbom_inventory)
             LOGGER.info(
@@ -793,6 +1157,39 @@ def main() -> None:
                     }
                 )
 
+    def skip_inventory_artifacts(paths: list[Path]) -> bool:
+        nonlocal s3_existing, inventory_existing
+        if not args.skip_existing_s3_sboms or s3_inventory is None:
+            return False
+        if not paths_present_in_inventory(
+            paths,
+            root=args.out_dir,
+            inventory=s3_inventory,
+        ):
+            return False
+        LOGGER.info(
+            "skipping local SBOM generation for inventory-present artifacts count=%d",
+            len(paths),
+        )
+        summary = inventory_upload_summary(
+            paths,
+            root=args.out_dir,
+            s3_uri=args.s3_uri,
+        )
+        with publish_lock:
+            s3_existing += summary.existing
+            inventory_existing += summary.existing
+            if progress:
+                progress.update(
+                    counts={
+                        "s3_uploaded": s3_uploaded,
+                        "s3_existing": s3_existing,
+                        "s3_inventory_existing": inventory_existing,
+                        "local_artifacts_cleaned": cleaned,
+                    }
+                )
+        return True
+
     try:
         entries = load_mapping_entries(args.mapping_json)
         LOGGER.info(
@@ -815,6 +1212,10 @@ def main() -> None:
             workers=args.workers,
             progress=progress,
             on_artifacts=publish_artifacts,
+            versions_per_package=args.versions_per_package,
+            artifact_subdirs=args.artifact_subdirs,
+            artifact_selection=args.artifact_selection,
+            skip_artifacts=skip_inventory_artifacts,
         )
     except (SbomError, S3PublishError, AdvisoryIndexError) as exc:
         if progress:
@@ -890,17 +1291,20 @@ def main() -> None:
         "generated "
         f"{len(result.generated) - result.existing} new SBOM(s); "
         f"{result.existing} already existed; "
+        f"{result.inventory_skipped} skipped from S3 inventory; "
         f"skipped {result.skipped} ineligible mapping(s); "
         f"{len(result.errors)} error(s)",
         file=sys.stderr,
     )
     LOGGER.info(
         "completed SBOM refresh new=%d existing=%d skipped=%d errors=%d "
-        "s3_uploaded=%d s3_existing=%d s3_inventory_existing=%d cleaned=%d",
+        "inventory_skipped=%d s3_uploaded=%d s3_existing=%d "
+        "s3_inventory_existing=%d cleaned=%d",
         len(result.generated) - result.existing,
         result.existing,
         result.skipped,
         len(result.errors),
+        result.inventory_skipped,
         s3_uploaded,
         s3_existing,
         inventory_existing,

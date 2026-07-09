@@ -1,5 +1,6 @@
 import { fetchJsonWithProgress } from "./progressFetch";
 import type {
+  AdvisoryDashboardPayload,
   MappingPackageIndex,
   MappingsIndexPayload,
   MappingsPayload,
@@ -22,6 +23,12 @@ async function loadJsonCached<T>(path: string): Promise<T> {
 
 export async function loadMappings(path = DEFAULT_PATH): Promise<MappingsPayload> {
   return loadJsonCached<MappingsPayload>(path);
+}
+
+export async function loadAdvisoryDashboardData(
+  path: string,
+): Promise<AdvisoryDashboardPayload> {
+  return loadJsonCached<AdvisoryDashboardPayload>(path);
 }
 
 export async function loadMappingsIndex(

@@ -67,6 +67,40 @@ class GenerateSbomsTests(unittest.TestCase):
             }
         }
 
+    def _historical_repodata(self) -> dict:
+        return {
+            "packages.conda": {
+                "demo-1.0.0-py_0.conda": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "build": "py_0",
+                    "build_number": 0,
+                    "sha256": "1" * 64,
+                },
+                "demo-1.2.0-py_0.conda": {
+                    "name": "demo",
+                    "version": "1.2.0",
+                    "build": "py_0",
+                    "build_number": 0,
+                    "sha256": "2" * 64,
+                },
+                "demo-1.2.0-py_1.conda": {
+                    "name": "demo",
+                    "version": "1.2.0",
+                    "build": "py_1",
+                    "build_number": 1,
+                    "sha256": "3" * 64,
+                },
+                "demo-1.10.0-py_0.conda": {
+                    "name": "demo",
+                    "version": "1.10.0",
+                    "build": "py_0",
+                    "build_number": 0,
+                    "sha256": "4" * 64,
+                },
+            }
+        }
+
     def test_load_mapping_entries_from_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_mapping_payload(Path(tmp))
@@ -179,6 +213,88 @@ class GenerateSbomsTests(unittest.TestCase):
         self.assertEqual(len(result.generated), 2)
         self.assertEqual(result.existing, 0)
         self.assertEqual(result.errors, [])
+
+    def test_generate_many_can_generate_latest_versions_per_package(self) -> None:
+        entries = [
+            (
+                "demo",
+                {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "build": "py_0",
+                    "subdir": "noarch",
+                    "purl": "pkg:pypi/demo-pkg",
+                    "pkg_name": "demo-pkg",
+                },
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "scripts.generate_sboms._load_json_ref",
+                return_value=self._historical_repodata(),
+            ):
+                result = generate_many(
+                    entries,
+                    channel="conda-forge",
+                    out_dir=Path(tmp) / "local-advisory-channel",
+                    purl_type_filter="pypi",
+                    versions_per_package=2,
+                )
+
+            sboms = [json.loads(path.read_text()) for path in result.generated]
+            filenames = {path.parent.name for path in result.generated}
+            purls = {sbom["components"][0]["purl"] for sbom in sboms}
+
+        self.assertEqual(len(result.generated), 2)
+        self.assertEqual(result.existing, 0)
+        self.assertEqual(result.inventory_skipped, 0)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(
+            purls,
+            {"pkg:pypi/demo-pkg@1.10.0", "pkg:pypi/demo-pkg@1.2.0"},
+        )
+        self.assertIn("demo-1.2.0-py_1.conda", filenames)
+
+    def test_generate_many_can_skip_inventory_present_historical_sboms(self) -> None:
+        entries = [
+            (
+                "demo",
+                {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "build": "py_0",
+                    "subdir": "noarch",
+                    "purl": "pkg:pypi/demo-pkg",
+                    "pkg_name": "demo-pkg",
+                },
+            )
+        ]
+        skipped_paths: list[Path] = []
+
+        def skip_artifacts(paths: list[Path]) -> bool:
+            skipped_paths.extend(paths)
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "scripts.generate_sboms._load_json_ref",
+                return_value=self._historical_repodata(),
+            ):
+                result = generate_many(
+                    entries,
+                    channel="conda-forge",
+                    out_dir=Path(tmp) / "local-advisory-channel",
+                    purl_type_filter="pypi",
+                    versions_per_package=1,
+                    skip_artifacts=skip_artifacts,
+                )
+
+        self.assertEqual(result.generated, [])
+        self.assertEqual(result.existing, 0)
+        self.assertEqual(result.inventory_skipped, 1)
+        self.assertEqual(len(skipped_paths), 2)
+        self.assertFalse(any(path.exists() for path in skipped_paths))
 
     def test_load_repodata_uses_fresh_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

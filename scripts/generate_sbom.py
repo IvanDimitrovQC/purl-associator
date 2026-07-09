@@ -320,6 +320,17 @@ def add_version_to_purl(purl: str, version: str) -> str:
     return f"{base}{qualifiers}{subpath}"
 
 
+def validate_mapping_purl_type(
+    mapping: dict[str, Any], *, package: str, purl_type_filter: str
+) -> None:
+    selected_type = purl_type(mapping.get("purl"))
+    if purl_type_filter != "any" and selected_type != purl_type_filter:
+        raise SbomError(
+            f"{package!r} maps to PURL type {selected_type!r}; "
+            f"expected {purl_type_filter!r}. Pass --purl-type any to allow it."
+        )
+
+
 def _distribution_url(
     *,
     channel: str,
@@ -477,6 +488,28 @@ def sbom_event_path(root: Path, *, subdir: str, filename: str, version: str) -> 
     )
 
 
+def expected_sbom_artifact_paths(
+    *,
+    mapping: dict[str, Any],
+    record: dict[str, Any],
+    root: Path,
+    subdir: str,
+    filename: str,
+    channel: str,
+) -> list[Path]:
+    version, _inputs_hash, _mapping_hash = sbom_version(
+        mapping=mapping,
+        record=record,
+        filename=filename,
+        channel=channel,
+        subdir=subdir,
+    )
+    return [
+        sbom_output_path(root, subdir=subdir, filename=filename, version=version),
+        sbom_event_path(root, subdir=subdir, filename=filename, version=version),
+    ]
+
+
 def sbom_artifact_paths(sbom_path: Path) -> list[Path]:
     paths = [sbom_path]
     if sbom_path.name.startswith("sbom-") and sbom_path.name.endswith(".cdx.json"):
@@ -610,6 +643,47 @@ def generate_sbom(
     )
 
 
+def generate_sbom_from_record(
+    mapping: dict[str, Any],
+    *,
+    record: dict[str, Any],
+    filename: str,
+    subdir: str,
+    channel: str,
+    purl_type_filter: str,
+) -> tuple[str, str, dict[str, Any]]:
+    package = mapping.get("name")
+    if not isinstance(package, str) or not package:
+        raise SbomError("mapping entry must include a string name")
+    if record.get("name") != package:
+        raise SbomError(
+            f"record {filename!r} is for package {record.get('name')!r}, "
+            f"not {package!r}"
+        )
+    validate_mapping_purl_type(
+        mapping, package=package, purl_type_filter=purl_type_filter
+    )
+    LOGGER.info(
+        "selected conda artifact package=%s subdir=%s filename=%s version=%s build=%s",
+        package,
+        subdir,
+        filename,
+        record.get("version"),
+        record.get("build"),
+    )
+    return (
+        filename,
+        subdir,
+        build_cyclonedx_sbom(
+            mapping=mapping,
+            record=record,
+            filename=filename,
+            channel=channel,
+            subdir=subdir,
+        ),
+    )
+
+
 def generate_sbom_from_mapping(
     mapping: dict[str, Any],
     *,
@@ -652,12 +726,9 @@ def generate_sbom_from_mapping(
         and build is None
     ):
         selected_filename = _filename_from_url(mapping.get("url"))
-    selected_type = purl_type(mapping.get("purl"))
-    if purl_type_filter != "any" and selected_type != purl_type_filter:
-        raise SbomError(
-            f"{package!r} maps to PURL type {selected_type!r}; "
-            f"expected {purl_type_filter!r}. Pass --purl-type any to allow it."
-        )
+    validate_mapping_purl_type(
+        mapping, package=package, purl_type_filter=purl_type_filter
+    )
 
     if repodata is None:
         repodata_source = repodata_ref or _default_repodata_url(
@@ -677,24 +748,13 @@ def generate_sbom_from_mapping(
         build=selected_build,
         filename=selected_filename,
     )
-    LOGGER.info(
-        "selected conda artifact package=%s subdir=%s filename=%s version=%s build=%s",
-        package,
-        selected_subdir,
-        record_filename,
-        record.get("version"),
-        record.get("build"),
-    )
-    return (
-        record_filename,
-        selected_subdir,
-        build_cyclonedx_sbom(
-            mapping=mapping,
-            record=record,
-            filename=record_filename,
-            channel=channel,
-            subdir=selected_subdir,
-        ),
+    return generate_sbom_from_record(
+        mapping,
+        record=record,
+        filename=record_filename,
+        subdir=selected_subdir,
+        channel=channel,
+        purl_type_filter=purl_type_filter,
     )
 
 

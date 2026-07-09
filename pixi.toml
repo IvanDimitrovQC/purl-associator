@@ -31,10 +31,13 @@ python = ">=3.13,<3.14"
 "sbom:generate-many" = "python -m scripts.generate_sboms"
 "sbom:refresh" = "python -m scripts.generate_sboms mappings/auto.json --cache-dir .cache/repodata"
 "sbom:s3-inventory" = "python -m scripts.s3_sbom_inventory"
+"sbom:summary" = "python -m scripts.sbom_summary"
 "osv:correlate" = "python -m scripts.correlate_osv"
 "osv:refresh" = "python -m scripts.refresh_osv"
 "osv:s3-inventory" = "python -m scripts.s3_osv_inventory"
+"osv:vulnerability-summary" = "python -m scripts.osv_vulnerability_summary"
 "advisory:index" = "python -m scripts.advisory_index"
+"advisory:dashboard-data" = "python -m scripts.advisory_dashboard_data"
 "sbom:test" = "python -m unittest discover -s tests"
 
 [environments]

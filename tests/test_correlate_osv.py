@@ -71,14 +71,23 @@ class CorrelateOsvTests(unittest.TestCase):
             )
 
         self.assertEqual(advisory["query_count"], 1)
+        self.assertEqual(advisory["schema_version"], 2)
         self.assertEqual(advisory["vulnerability_count"], 1)
         self.assertEqual(
             advisory["components"][0]["vulnerabilities"][0]["id"],
             "GHSA-demo-0001",
         )
         self.assertEqual(
+            advisory["components"][0]["vulnerabilities"][0]["url"],
+            "https://osv.dev/vulnerability/GHSA-demo-0001",
+        )
+        self.assertEqual(
             advisory["findings"][0]["component_purl"],
             "pkg:pypi/demo-pkg@1.2.3",
+        )
+        self.assertEqual(
+            advisory["findings"][0]["url"],
+            "https://osv.dev/vulnerability/GHSA-demo-0001",
         )
         self.assertEqual(
             advisory["skipped_components"][0]["reason"],

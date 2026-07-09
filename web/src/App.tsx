@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useGithubAuth } from "./auth/useGithubAuth";
+import { AdvisoryDashboard } from "./components/AdvisoryDashboard";
 import { BulkPanel } from "./components/BulkPanel";
 import { LoadingToast } from "./components/LoadingToast";
 import { LocalDraftBanner } from "./components/LocalDraftBanner";
@@ -16,6 +17,9 @@ import { usePurlEditStore } from "./stores/userState";
 
 export function App() {
   const theme = useTheme();
+  const [activeView, setActiveView] = useState<"dashboard" | "mapper">(
+    "dashboard",
+  );
   const {
     payload,
     packages,
@@ -40,6 +44,28 @@ export function App() {
   const { token, user, error: authError, isLoggedIn, signOut } = useGithubAuth();
 
   const t = theme.t;
+  const navButton = (view: "dashboard" | "mapper", label: string) => {
+    const active = activeView === view;
+    return (
+      <button
+        onClick={() => setActiveView(view)}
+        style={{
+          color: active ? t.fg1 : t.fg2,
+          padding: "5px 8px",
+          borderRadius: 6,
+          background: active ? t.inset : "transparent",
+          border: `1px solid ${active ? t.border : "transparent"}`,
+          cursor: "pointer",
+          fontSize: 11,
+          fontWeight: 700,
+          textTransform: "uppercase",
+          fontFamily: "Inter, sans-serif",
+        }}
+      >
+        {label}
+      </button>
+    );
+  };
 
   // Default: when packages first arrive, focus the first row (but don't
   // mark it as selected — selection is the checkbox state).
@@ -216,16 +242,8 @@ export function App() {
               paddingLeft: 14,
             }}
           >
-            <span
-              style={{
-                color: t.fg1,
-                padding: "4px 8px",
-                borderRadius: 6,
-                background: t.inset,
-              }}
-            >
-              Package Identity Mapper
-            </span>
+            {navButton("dashboard", "Advisory Dashboard")}
+            {navButton("mapper", "PURL Mapper")}
           </nav>
           <div
             style={{
@@ -266,53 +284,57 @@ export function App() {
             {theme.dark ? "☀" : "☾"}
           </button>
 
-          <Btn
-            theme={theme}
-            variant={editsCount > 0 ? "primary" : "ghost"}
-            icon="pr"
-            onClick={() => setDrawerOpen(true)}
-            disabled={editsCount === 0}
-          >
-            {editsCount === 0 ? "No staged changes" : `Review changes (${editsCount})`}
-          </Btn>
-
-          {isLoggedIn && user ? (
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 7,
-                padding: "3px 8px 3px 4px",
-                border: `1px solid ${t.border}`,
-                borderRadius: 999,
-              }}
+          {activeView === "mapper" && (
+            <Btn
+              theme={theme}
+              variant={editsCount > 0 ? "primary" : "ghost"}
+              icon="pr"
+              onClick={() => setDrawerOpen(true)}
+              disabled={editsCount === 0}
             >
-              <img
-                src={user.avatar_url}
-                alt={user.login}
-                width={22}
-                height={22}
-                style={{ borderRadius: "50%" }}
-              />
-              <span style={{ fontSize: 12, fontWeight: 600, color: t.fg1 }}>
-                @{user.login}
-              </span>
-              <button
-                onClick={signOut}
-                title="Sign out"
+              {editsCount === 0
+                ? "No staged changes"
+                : `Review changes (${editsCount})`}
+            </Btn>
+          )}
+
+          {activeView === "mapper" && isLoggedIn && user ? (
+              <div
                 style={{
-                  background: "transparent",
-                  border: 0,
-                  color: t.fg3,
-                  cursor: "pointer",
-                  padding: 2,
-                  marginLeft: 2,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                  padding: "3px 8px 3px 4px",
+                  border: `1px solid ${t.border}`,
+                  borderRadius: 999,
                 }}
               >
-                <Glyph name="close" size={11} />
-              </button>
-            </div>
-          ) : (
+                <img
+                  src={user.avatar_url}
+                  alt={user.login}
+                  width={22}
+                  height={22}
+                  style={{ borderRadius: "50%" }}
+                />
+                <span style={{ fontSize: 12, fontWeight: 600, color: t.fg1 }}>
+                  @{user.login}
+                </span>
+                <button
+                  onClick={signOut}
+                  title="Sign out"
+                  style={{
+                    background: "transparent",
+                    border: 0,
+                    color: t.fg3,
+                    cursor: "pointer",
+                    padding: 2,
+                    marginLeft: 2,
+                  }}
+                >
+                  <Glyph name="close" size={11} />
+                </button>
+              </div>
+            ) : activeView === "mapper" ? (
             <Btn
               theme={theme}
               variant="secondary"
@@ -321,23 +343,25 @@ export function App() {
             >
               Sign in
             </Btn>
-          )}
+          ) : null}
         </div>
       </header>
 
-      <LocalDraftBanner
-        theme={theme}
-        count={editsCount}
-        noun="change"
-        onReview={() => setDrawerOpen(true)}
-        onDiscard={() => {
-          if (window.confirm("Discard all locally saved staged changes?")) {
-            setEdits({});
-          }
-        }}
-      />
+      {activeView === "mapper" && (
+        <LocalDraftBanner
+          theme={theme}
+          count={editsCount}
+          noun="change"
+          onReview={() => setDrawerOpen(true)}
+          onDiscard={() => {
+            if (window.confirm("Discard all locally saved staged changes?")) {
+              setEdits({});
+            }
+          }}
+        />
+      )}
 
-      {!isLoggedIn && (
+      {activeView === "mapper" && !isLoggedIn && (
         <div
           style={{
             padding: "7px 18px",
@@ -370,7 +394,7 @@ export function App() {
         </div>
       )}
 
-      {authError && (
+      {activeView === "mapper" && authError && (
         <div
           style={{
             padding: "7px 18px",
@@ -383,7 +407,7 @@ export function App() {
         </div>
       )}
 
-      {(loadError || detailError) && (
+      {activeView === "mapper" && (loadError || detailError) && (
         <div
           style={{
             padding: "7px 18px",
@@ -396,82 +420,88 @@ export function App() {
         </div>
       )}
 
-      <div
-        style={{
-          flex: 1,
-          display: "grid",
-          gridTemplateColumns: "minmax(0, 60fr) minmax(0, 40fr)",
-          minHeight: 0,
-        }}
-      >
-        <div style={{ minWidth: 0, minHeight: 0 }}>
-          {payload ? (
-            <PackageTable
-              theme={theme}
-              packages={packages}
-              edits={edits}
-              selectedSet={selectedSet}
-              setSelectedSet={setSelectedSet}
-              focusedId={focusedId}
-              setFocusedId={setFocusedId}
-              q={q}
-              setQ={setQ}
-              filters={filters}
-              setFilters={setFilters}
-            />
-          ) : (
-            <div
-              style={{
-                padding: 30,
-                color: t.fg2,
-                textAlign: "center",
-                fontSize: 13,
-              }}
-            >
-              Loading mappings…
-            </div>
-          )}
+      {activeView === "dashboard" ? (
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <AdvisoryDashboard theme={theme} />
         </div>
+      ) : (
+        <div
+          style={{
+            flex: 1,
+            display: "grid",
+            gridTemplateColumns: "minmax(0, 60fr) minmax(0, 40fr)",
+            minHeight: 0,
+          }}
+        >
+          <div style={{ minWidth: 0, minHeight: 0 }}>
+            {payload ? (
+              <PackageTable
+                theme={theme}
+                packages={packages}
+                edits={edits}
+                selectedSet={selectedSet}
+                setSelectedSet={setSelectedSet}
+                focusedId={focusedId}
+                setFocusedId={setFocusedId}
+                q={q}
+                setQ={setQ}
+                filters={filters}
+                setFilters={setFilters}
+              />
+            ) : (
+              <div
+                style={{
+                  padding: 30,
+                  color: t.fg2,
+                  textAlign: "center",
+                  fontSize: 13,
+                }}
+              >
+                Loading mappings…
+              </div>
+            )}
+          </div>
 
-        <div style={{ minWidth: 0, display: "flex" }}>
-          {showBulk ? (
-            <BulkPanel
-              theme={theme}
-              selectedPackages={selectedPackages}
-              edits={edits}
-              onApproveAll={handleBulkApprove}
-              onMarkUnmappedAll={handleBulkMarkUnmapped}
-              onResetSelected={handleBulkResetSelected}
-              onClearSelection={() => setSelectedSet(new Set())}
-            />
-          ) : focusedId && loadingDetails.has(focusedId) && !focusedPkg ? (
-            <div
-              style={{
-                flex: 1,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                background: t.page,
-                color: t.fg2,
-                fontSize: 13,
-              }}
-            >
-              Loading package details…
-            </div>
-          ) : (
-            <MappingEditor
-              theme={theme}
-              pkg={focusedPkg}
-              edit={focusedPkg ? edits[focusedPkg.name] : undefined}
-              onEdit={handleEdit}
-              onApprove={handleApprove}
-              onResetAuto={handleResetAuto}
-            />
-          )}
+          <div style={{ minWidth: 0, display: "flex" }}>
+            {showBulk ? (
+              <BulkPanel
+                theme={theme}
+                selectedPackages={selectedPackages}
+                edits={edits}
+                onApproveAll={handleBulkApprove}
+                onMarkUnmappedAll={handleBulkMarkUnmapped}
+                onResetSelected={handleBulkResetSelected}
+                onClearSelection={() => setSelectedSet(new Set())}
+              />
+            ) : focusedId && loadingDetails.has(focusedId) && !focusedPkg ? (
+              <div
+                style={{
+                  flex: 1,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: t.page,
+                  color: t.fg2,
+                  fontSize: 13,
+                }}
+              >
+                Loading package details…
+              </div>
+            ) : (
+              <MappingEditor
+                theme={theme}
+                pkg={focusedPkg}
+                edit={focusedPkg ? edits[focusedPkg.name] : undefined}
+                onEdit={handleEdit}
+                onApprove={handleApprove}
+                onResetAuto={handleResetAuto}
+              />
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
-      {drawerOpen && (
+      {activeView === "mapper" && drawerOpen && (
         <PRDrawer
           theme={theme}
           edits={edits}
@@ -494,7 +524,9 @@ export function App() {
         />
       )}
 
-      {loginOpen && <LoginModal theme={theme} onClose={() => setLoginOpen(false)} />}
+      {activeView === "mapper" && loginOpen && (
+        <LoginModal theme={theme} onClose={() => setLoginOpen(false)} />
+      )}
       <LoadingToast theme={theme} />
     </div>
   );
