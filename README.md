@@ -427,6 +427,7 @@ pixi run -e lite advisory:dashboard-data \
   --mapping-json mappings/auto.json \
   --osv-summary .tmp/osv-vulnerability-summary.json \
   --out web/public/advisory-dashboard-data.json \
+  --s3-output-uri s3://<bucket>/temp \
   --workers 8
 ```
 
@@ -435,7 +436,11 @@ The dashboard payload includes package-level flags such as `missing_purl`,
 `no_known_vulnerabilities`, and latest-indexed-version flags. It also keeps the
 artifact rows needed to drill down by version, platform subdir, and build. When
 OSV findings are present, their IDs link to the corresponding OSV page. Dashboard
-payloads with vulnerability URLs use schema version 2.
+payloads with vulnerability URLs use schema version 2. When `--s3-output-uri` is
+set, the generated dashboard JSON is uploaded to that separate S3 prefix using
+the local output filename. This lets the dashboard read advisory-channel data
+from one prefix, such as `s3://<bucket>/test1`, while publishing the handoff JSON
+to another prefix, such as `s3://<bucket>/temp/advisory-dashboard-data.json`.
 
 S3 keys preserve the local channel-relative path. For example:
 

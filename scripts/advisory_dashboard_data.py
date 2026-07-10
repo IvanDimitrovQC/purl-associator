@@ -22,6 +22,7 @@ from scripts.s3_publish import (
     add_s3_args,
     aws_global_args,
     s3_uri_for_relative_path,
+    upload_file,
 )
 
 DEFAULT_OUTPUT_PATH = Path("web") / "public" / "advisory-dashboard-data.json"
@@ -610,6 +611,26 @@ def write_dashboard_payload(*, payload: dict[str, Any], out: Path) -> Path:
     return out
 
 
+def upload_dashboard_payload(
+    *,
+    out: Path,
+    s3_output_uri: str,
+    profile: str | None = None,
+    region: str | None = None,
+    runner: Runner = subprocess.run,
+) -> str:
+    result = upload_file(
+        local_path=out,
+        root=out.parent,
+        s3_uri=s3_output_uri,
+        profile=profile,
+        region=region,
+        overwrite=True,
+        runner=runner,
+    )
+    return result.s3_uri
+
+
 def build_dashboard_data(
     *,
     s3_uri: str,
@@ -666,6 +687,13 @@ def main() -> None:
         default=DEFAULT_WORKERS,
         help="parallel S3 advisory-index reads",
     )
+    parser.add_argument(
+        "--s3-output-uri",
+        help=(
+            "optional s3://bucket/prefix destination for the generated dashboard "
+            "JSON; the output filename is written below this prefix"
+        ),
+    )
     add_s3_args(parser, include_cleanup=False, include_dry_run=False)
     add_logging_args(parser, command_name="advisory-dashboard-data")
     args = parser.parse_args()
@@ -680,12 +708,13 @@ def main() -> None:
             raise DashboardDataError("--s3-uri is required")
         LOGGER.info(
             "starting dashboard data build s3_uri=%s mapping_json=%s "
-            "osv_summary=%s out=%s workers=%d",
+            "osv_summary=%s out=%s workers=%d s3_output_uri=%s",
             args.s3_uri,
             args.mapping_json,
             args.osv_summary,
             args.out,
             args.workers,
+            args.s3_output_uri,
         )
         payload = build_dashboard_data(
             s3_uri=args.s3_uri,
@@ -696,6 +725,16 @@ def main() -> None:
             region=args.s3_region,
         )
         out = write_dashboard_payload(payload=payload, out=args.out)
+        uploaded_uri = (
+            upload_dashboard_payload(
+                out=out,
+                s3_output_uri=args.s3_output_uri,
+                profile=args.s3_profile,
+                region=args.s3_region,
+            )
+            if args.s3_output_uri
+            else None
+        )
     except (DashboardDataError, S3PublishError) as exc:
         LOGGER.error("dashboard data build failed error=%s", exc)
         print(f"error: {exc}", file=sys.stderr)
@@ -709,13 +748,16 @@ def main() -> None:
         f"{payload['counts']['artifacts']} artifact(s)",
         file=sys.stderr,
     )
+    if uploaded_uri:
+        print(f"uploaded advisory dashboard data to {uploaded_uri}", file=sys.stderr)
     LOGGER.info(
         "completed dashboard data build out=%s packages=%d artifacts=%d "
-        "vulnerability_findings=%d",
+        "vulnerability_findings=%d s3_output=%s",
         out,
         payload["counts"]["packages"],
         payload["counts"]["artifacts"],
         payload["counts"]["vulnerability_findings"],
+        uploaded_uri,
     )
     print_log_location(log_path)
 
