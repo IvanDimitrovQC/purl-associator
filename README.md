@@ -480,22 +480,46 @@ The `--update-index` flag keeps mutable catalog files in the advisory channel:
 ```text
 local-advisory-channel/channel-index.json
 local-advisory-channel/<subdir>/advisory-repodata.json
+local-advisory-channel/<subdir>/advisory-repodata-shards/<sha256>.json
 ```
 
 `channel-index.json` points at each subdir index. Each
-`advisory-repodata.json` is keyed by conda artifact filename and stores the
-current SBOM path/version, component PURLs, current OSV advisory path/version,
-finding IDs, vulnerability count, and a compact status such as
-`no_known_vulnerabilities` or `vulnerabilities_found`. Full SBOM and OSV details
-remain in their separate artifacts.
+`advisory-repodata.json` is a small shard index keyed by package name. The shard
+index maps each package name to a content-addressed JSON shard under
+`advisory-repodata-shards/`. Each shard stores the current records for that
+package's conda artifact filenames, including current SBOM path/version,
+component PURLs, current OSV advisory path/version, finding IDs, vulnerability
+count, and a compact status such as `no_known_vulnerabilities` or
+`vulnerabilities_found`. Full SBOM and OSV details remain in their separate
+artifacts.
 
 Indexes are mutable snapshots. They are uploaded to S3 with overwrite semantics,
-while content-addressed SBOM and OSV artifacts remain append-only. To rebuild
-indexes from local artifacts at any point, run:
+while content-addressed SBOM and OSV artifacts remain append-only. Shard files
+are also content-addressed, so unchanged package-name shards keep the same path
+across rebuilds. To rebuild indexes from local artifacts at any point, run:
 
 ```sh
 pixi run -e lite advisory:index
 ```
+
+To rebuild the mutable sharded indexes from the current S3 storage state, stream
+the existing SBOM and OSV artifacts from S3 and upload the resulting
+`channel-index.json`, subdir shard indexes, and shard files:
+
+```sh
+pixi run -e lite advisory:index \
+  --s3-source-uri s3://<bucket>/<prefix> \
+  --s3-sbom-inventory .tmp/s3-sbom-inventory.json \
+  --s3-osv-inventory .tmp/s3-osv-inventory.json \
+  --channel-root .tmp/advisory-index \
+  --s3-uri s3://<bucket>/<prefix> \
+  --s3-profile <profile> \
+  --s3-region <region> \
+  --workers 8 \
+  --s3-workers 8
+```
+
+On EC2 with an instance role, omit `--s3-profile`.
 
 ## Verification
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
+from scripts.advisory_index import SHARDS_DIR
 from scripts.correlate_osv import osv_vulnerability_url
 from scripts.generate_sboms import load_mapping_entries
 from scripts.s3_publish import (
@@ -97,6 +98,111 @@ def read_s3_json(
     return data
 
 
+def _shard_relative_path(*, subdir_index: dict[str, Any], entry: Any) -> str | None:
+    if isinstance(entry, str) and entry:
+        digest = entry
+        path = None
+    elif isinstance(entry, dict):
+        path = entry.get("path")
+        digest = entry.get("sha256")
+    else:
+        return None
+    if isinstance(path, str) and path:
+        return path.lstrip("/")
+    if not isinstance(digest, str) or not digest:
+        return None
+    base_url = subdir_index.get("shards_base_url")
+    if not isinstance(base_url, str) or not base_url:
+        base_url = f"{SHARDS_DIR}/"
+    return f"{base_url.rstrip('/')}/{digest}.json"
+
+
+def _s3_shard_path(*, subdir_index: dict[str, Any], entry: Any) -> str | None:
+    subdir = subdir_index.get("subdir")
+    if not isinstance(subdir, str) or not subdir:
+        return None
+    shard_relative = _shard_relative_path(subdir_index=subdir_index, entry=entry)
+    if not shard_relative:
+        return None
+    return f"{subdir}/{shard_relative}"
+
+
+def expand_s3_sharded_indexes(
+    subdir_indexes: list[dict[str, Any]],
+    *,
+    s3_uri: str,
+    profile: str | None = None,
+    region: str | None = None,
+    workers: int = DEFAULT_WORKERS,
+    runner: Runner = subprocess.run,
+) -> list[dict[str, Any]]:
+    _validate_workers(workers)
+    expanded = [dict(index) for index in subdir_indexes]
+    shard_reads: list[tuple[int, str]] = []
+    for index, subdir_index in enumerate(expanded):
+        packages = subdir_index.get("packages")
+        if isinstance(packages, dict):
+            continue
+        shards = subdir_index.get("shards")
+        if not isinstance(shards, dict):
+            subdir_index["packages"] = {}
+            continue
+        for name, entry in sorted(shards.items()):
+            shard_path = _s3_shard_path(subdir_index=subdir_index, entry=entry)
+            if not shard_path:
+                raise DashboardDataError(
+                    f"invalid shard entry for package {name!r} in subdir index"
+                )
+            shard_reads.append((index, shard_path))
+
+    if not shard_reads:
+        return expanded
+
+    LOGGER.info("loading advisory-repodata shards count=%d", len(shard_reads))
+    shard_results: list[tuple[int, dict[str, Any]] | None] = [None] * len(shard_reads)
+    if workers == 1 or len(shard_reads) <= 1:
+        for index, (subdir_index, shard_path) in enumerate(shard_reads):
+            shard_results[index] = (
+                subdir_index,
+                read_s3_json(
+                    relative_path=shard_path,
+                    s3_uri=s3_uri,
+                    profile=profile,
+                    region=region,
+                    runner=runner,
+                ),
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    read_s3_json,
+                    relative_path=shard_path,
+                    s3_uri=s3_uri,
+                    profile=profile,
+                    region=region,
+                    runner=runner,
+                ): (index, subdir_index)
+                for index, (subdir_index, shard_path) in enumerate(shard_reads)
+            }
+            for future in as_completed(futures):
+                result_index, subdir_index = futures[future]
+                shard_results[result_index] = (subdir_index, future.result())
+
+    for result in shard_results:
+        if result is None:
+            continue
+        subdir_index, shard = result
+        shard_packages = shard.get("packages")
+        if not isinstance(shard_packages, dict):
+            raise DashboardDataError("advisory-repodata shard is missing packages")
+        packages = expanded[subdir_index].setdefault("packages", {})
+        if not isinstance(packages, dict):
+            raise DashboardDataError("expanded subdir packages must be an object")
+        packages.update(shard_packages)
+    return expanded
+
+
 def load_s3_advisory_indexes(
     *,
     s3_uri: str,
@@ -125,7 +231,7 @@ def load_s3_advisory_indexes(
     LOGGER.info("loading subdir advisory indexes count=%d", len(index_paths))
 
     if workers == 1 or len(index_paths) <= 1:
-        return channel_index, [
+        subdir_indexes = [
             read_s3_json(
                 relative_path=path,
                 s3_uri=s3_uri,
@@ -135,6 +241,14 @@ def load_s3_advisory_indexes(
             )
             for path in index_paths
         ]
+        return channel_index, expand_s3_sharded_indexes(
+            subdir_indexes,
+            s3_uri=s3_uri,
+            profile=profile,
+            region=region,
+            workers=workers,
+            runner=runner,
+        )
 
     indexes: list[dict[str, Any] | None] = [None] * len(index_paths)
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -151,7 +265,15 @@ def load_s3_advisory_indexes(
         }
         for future in as_completed(futures):
             indexes[futures[future]] = future.result()
-    return channel_index, [index for index in indexes if index is not None]
+    subdir_indexes = [index for index in indexes if index is not None]
+    return channel_index, expand_s3_sharded_indexes(
+        subdir_indexes,
+        s3_uri=s3_uri,
+        profile=profile,
+        region=region,
+        workers=workers,
+        runner=runner,
+    )
 
 
 def load_mapping_by_name(path: Path) -> dict[str, dict[str, Any]]:
