@@ -168,8 +168,8 @@ class GenerateSbomsTests(unittest.TestCase):
         self.assertEqual(result.skipped, 1)
         self.assertEqual(result.errors, [])
         self.assertEqual(sbom["components"][0]["purl"], "pkg:pypi/demo-pkg@1.2.3")
-        self.assertEqual(out.name[:8], "sbom-v1-")
-        self.assertEqual(len(published), 2)
+        self.assertTrue(out.name.startswith("sbom-"))
+        self.assertEqual(len(published), 1)
         self.assertEqual(progress_data["counts"]["processed"], 1)
 
     def test_generate_many_can_run_with_workers(self) -> None:
@@ -293,7 +293,7 @@ class GenerateSbomsTests(unittest.TestCase):
         self.assertEqual(result.generated, [])
         self.assertEqual(result.existing, 0)
         self.assertEqual(result.inventory_skipped, 1)
-        self.assertEqual(len(skipped_paths), 2)
+        self.assertEqual(len(skipped_paths), 1)
         self.assertFalse(any(path.exists() for path in skipped_paths))
 
     def test_load_repodata_uses_fresh_cache(self) -> None:
@@ -321,16 +321,14 @@ class GenerateSbomsTests(unittest.TestCase):
     def test_s3_sbom_inventory_matches_channel_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "local-advisory-channel"
-            sbom_path = root / "noarch" / "sboms" / "demo" / "sbom-v1-abc.cdx.json"
-            event_path = root / "noarch" / "sboms" / "demo" / "event-v1-abc.json"
+            sbom_path = root / "noarch" / "sboms" / "demo" / "sbom-abc.cdx.json"
             inventory_path = Path(tmp) / "inventory.json"
             inventory_path.write_text(
                 json.dumps(
                     {
                         "schema_version": 1,
                         "objects": [
-                            "noarch/sboms/demo/sbom-v1-abc.cdx.json",
-                            "noarch/sboms/demo/event-v1-abc.json",
+                            "noarch/sboms/demo/sbom-abc.cdx.json",
                         ],
                     }
                 )
@@ -340,7 +338,7 @@ class GenerateSbomsTests(unittest.TestCase):
             inventory = load_s3_sbom_inventory(inventory_path)
             self.assertTrue(
                 paths_present_in_inventory(
-                    [sbom_path, event_path],
+                    [sbom_path],
                     root=root,
                     inventory=inventory,
                 )

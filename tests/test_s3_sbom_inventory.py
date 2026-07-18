@@ -13,28 +13,26 @@ from scripts.s3_sbom_inventory import (
 
 
 class S3SbomInventoryTests(unittest.TestCase):
-    def test_filter_sbom_inventory_paths_keeps_sboms_and_events(self) -> None:
+    def test_filter_sbom_inventory_paths_keeps_only_sboms(self) -> None:
         paths = filter_sbom_inventory_paths(
             [
                 "channel-index.json",
-                "noarch/sboms/demo/sbom-v1-abc.cdx.json",
-                "noarch/sboms/demo/event-v1-abc.json",
-                "noarch/advisories/demo/osv-v1-abc-def.json",
+                "noarch/sboms/demo/sbom-abc.cdx.json",
+                "noarch/sboms/demo/event-abc.json",
+                "noarch/advisories/demo/osv-abc-def.json",
             ]
         )
 
         self.assertEqual(
             paths,
             [
-                "noarch/sboms/demo/event-v1-abc.json",
-                "noarch/sboms/demo/sbom-v1-abc.cdx.json",
+                "noarch/sboms/demo/sbom-abc.cdx.json",
             ],
         )
 
     def test_write_inventory_payload(self) -> None:
         object_paths = [
-            "noarch/sboms/demo/event-v1-abc.json",
-            "noarch/sboms/demo/sbom-v1-abc.cdx.json",
+            "noarch/sboms/demo/sbom-abc.cdx.json",
         ]
         payload = sbom_inventory_payload(
             s3_uri="s3://demo-bucket/prefix",
@@ -46,9 +44,10 @@ class S3SbomInventoryTests(unittest.TestCase):
             written = json.loads(out.read_text())
 
         self.assertEqual(written["s3_uri"], "s3://demo-bucket/prefix")
-        self.assertEqual(written["object_count"], 2)
+        self.assertEqual(written["schema_version"], 2)
+        self.assertEqual(written["object_count"], 1)
         self.assertEqual(written["sbom_count"], 1)
-        self.assertEqual(written["event_count"], 1)
+        self.assertNotIn("event_count", written)
         self.assertEqual(written["objects"], object_paths)
 
 

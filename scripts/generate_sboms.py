@@ -986,7 +986,7 @@ def main() -> None:
         action="store_true",
         help=(
             "with --s3-sbom-inventory, skip local SBOM generation when the exact "
-            "SBOM and event paths already exist in the inventory"
+            "SBOM path already exists in the inventory"
         ),
     )
     add_s3_args(parser)

@@ -35,7 +35,6 @@ DEFAULT_OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 DEFAULT_OSV_BATCH_SIZE = 250
 DEFAULT_OSV_RETRIES = 3
 DEFAULT_OSV_RETRY_DELAY_SECONDS = 1.0
-ADVISORY_VERSION_PREFIX = "v1"
 OSV_ADVISORY_SCHEMA_VERSION = 2
 OSV_VULNERABILITY_URL_BASE = "https://osv.dev/vulnerability"
 LOGGER = logging.getLogger("scripts.correlate_osv")
@@ -441,14 +440,12 @@ def normalized_advisory(advisory: dict[str, Any]) -> dict[str, Any]:
 
 
 def advisory_content_hash(advisory: dict[str, Any]) -> str:
-    return _sha256(normalized_advisory(advisory))[:12]
+    return _sha256(normalized_advisory(advisory))
 
 
 def finalized_advisory(advisory: dict[str, Any]) -> dict[str, Any]:
     finalized = copy.deepcopy(advisory)
-    finalized["correlation_version"] = (
-        f"{ADVISORY_VERSION_PREFIX}-{advisory_content_hash(advisory)}"
-    )
+    finalized["correlation_version"] = advisory_content_hash(advisory)
     return finalized
 
 

@@ -148,14 +148,14 @@ By default the command reads the split mapping payload, uses the mapped
 `repodata.json` for that subdir, and writes:
 
 ```text
-local-advisory-channel/<subdir>/sboms/<filename>/sbom-v1-<hash>.cdx.json
+local-advisory-channel/<subdir>/sboms/<filename>/sbom-<hash>.cdx.json
 ```
 
-The `v1-<hash>` version is content-addressed from SBOM-significant inputs: the
+The `<hash>` version is content-addressed from SBOM-significant inputs: the
 conda artifact metadata, the mapping fields emitted into the SBOM, and the SBOM
 generator input schema. Volatile values such as generation time do not affect
 the version. Running the same generation twice for unchanged significant inputs
-returns the same path and does not rewrite the SBOM or duplicate its event file.
+returns the same path and does not rewrite the SBOM.
 When the mapped PURL or another SBOM-visible field changes, a new versioned SBOM
 is appended next to the old one.
 
@@ -224,7 +224,7 @@ You can then query OSV for the component PURLs in that SBOM:
 
 ```sh
 pixi run -e lite osv:correlate \
-  local-advisory-channel/<subdir>/sboms/<filename>/sbom-v1-<hash>.cdx.json
+  local-advisory-channel/<subdir>/sboms/<filename>/sbom-<hash>.cdx.json
 ```
 
 The correlator calls OSV's `/v1/querybatch` endpoint with versioned component
@@ -232,7 +232,7 @@ PURLs and writes:
 
 ```text
 local-advisory-channel/<subdir>/advisories/<filename>/
-  osv-v1-<sbom-hash>-<osv-hash>.json
+  osv-<sbom-hash>-<osv-hash>.json
 ```
 
 That sidecar contains the SBOM subject, the queried components, skipped
@@ -333,11 +333,11 @@ pixi run -e lite sbom:refresh \
 This is a resume-time optimization: the refresh still builds each candidate
 SBOM locally so it can compute the content-addressed path and update indexes.
 When `--skip-existing-s3-sboms` is also set, historical SBOM refreshes can
-compute the exact expected SBOM/event paths from repodata and the mapping first;
-if both paths are listed in the inventory, local SBOM generation is skipped
-entirely for that artifact. Otherwise, when both the SBOM and event paths are
-listed in the inventory, it skips the per-object S3 existence checks/uploads and
-removes the local temp files when `--cleanup-uploaded` is set.
+compute the exact expected SBOM path from repodata and the mapping first; if the
+path is listed in the inventory, local SBOM generation is skipped entirely for
+that artifact. Otherwise, when the SBOM path is listed in the inventory, it skips
+the per-object S3 existence check/upload and removes the local temp file when
+`--cleanup-uploaded` is set.
 
 To write a lightweight local summary of the SBOM state in S3, reuse the same
 inventory:
@@ -351,10 +351,10 @@ pixi run -e lite sbom:summary \
   --out .tmp/sbom-summary.json
 ```
 
-The summary counts SBOM files, event files, complete SBOM/event pairs, missing
-events, subdirs, packages, and package versions without downloading every SBOM
-JSON. It derives package/version/build from the conda artifact filename. Pass
-`--include-artifacts` if you also want per-artifact rows in the output.
+The summary counts SBOM files, subdirs, packages, and package versions without
+downloading every SBOM JSON. It derives package/version/build from the conda
+artifact filename. Pass `--include-artifacts` if you also want per-artifact rows
+in the output.
 
 OSV advisory artifacts support the same S3 publication pattern. Because OSV
 artifacts are derived from a specific SBOM version and current OSV response
@@ -445,13 +445,13 @@ to another prefix, such as `s3://<bucket>/temp/advisory-dashboard-data.json`.
 S3 keys preserve the local channel-relative path. For example:
 
 ```text
-local-advisory-channel/noarch/sboms/demo/sbom-v1-abc.cdx.json
+local-advisory-channel/noarch/sboms/demo/sbom-abc.cdx.json
 ```
 
 is published as:
 
 ```text
-s3://<bucket>/<prefix>/noarch/sboms/demo/sbom-v1-abc.cdx.json
+s3://<bucket>/<prefix>/noarch/sboms/demo/sbom-abc.cdx.json
 ```
 
 Before uploading, the publisher checks whether the target object already exists
@@ -496,7 +496,9 @@ artifacts.
 Indexes are mutable snapshots. They are uploaded to S3 with overwrite semantics,
 while content-addressed SBOM and OSV artifacts remain append-only. Shard files
 are also content-addressed, so unchanged package-name shards keep the same path
-across rebuilds. To rebuild indexes from local artifacts at any point, run:
+across rebuilds. These sharded indexes are also the SBOM generation tracker, so
+the channel does not write one event sidecar per SBOM. To rebuild indexes from
+local artifacts at any point, run:
 
 ```sh
 pixi run -e lite advisory:index

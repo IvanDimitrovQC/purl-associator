@@ -17,19 +17,19 @@ class S3OsvInventoryTests(unittest.TestCase):
         paths = filter_osv_inventory_paths(
             [
                 "channel-index.json",
-                "noarch/sboms/demo/sbom-v1-abc.cdx.json",
-                "noarch/advisories/demo/osv-v1-abc-def.json",
+                "noarch/sboms/demo/sbom-abc.cdx.json",
+                "noarch/advisories/demo/osv-abc-def.json",
                 "noarch/advisories/demo/notes.json",
             ]
         )
 
         self.assertEqual(
             paths,
-            ["noarch/advisories/demo/osv-v1-abc-def.json"],
+            ["noarch/advisories/demo/osv-abc-def.json"],
         )
 
     def test_write_inventory_payload(self) -> None:
-        object_paths = ["noarch/advisories/demo/osv-v1-abc-def.json"]
+        object_paths = ["noarch/advisories/demo/osv-abc-def.json"]
         payload = osv_inventory_payload(
             s3_uri="s3://demo-bucket/prefix",
             object_paths=object_paths,

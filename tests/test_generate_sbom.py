@@ -13,7 +13,6 @@ from scripts.generate_sbom import (
     get_sbom_version,
     load_mapping_entry,
     load_mapping_entry_file,
-    sbom_event_path,
     sbom_output_path,
     write_versioned_sbom,
 )
@@ -128,7 +127,7 @@ class GenerateSbomTests(unittest.TestCase):
             sbom["dependencies"][0]["dependsOn"],
             ["pkg:pypi/demo-pkg@1.2.3"],
         )
-        self.assertRegex(get_sbom_version(sbom), r"^v1-[0-9a-f]{12}$")
+        self.assertRegex(get_sbom_version(sbom), r"^[0-9a-f]{64}$")
 
     def test_generate_sbom_from_mapping_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,18 +200,11 @@ class GenerateSbomTests(unittest.TestCase):
                 filename="demo-1.2.3-py_0.conda",
                 version=version,
             )
-            expected_event_path = sbom_event_path(
-                root / "channel",
-                subdir="noarch",
-                filename="demo-1.2.3-py_0.conda",
-                version=version,
-            )
 
             self.assertEqual(first_path, second_path)
             self.assertTrue(first_created)
             self.assertFalse(second_created)
             self.assertEqual(first_path, expected_sbom_path)
-            self.assertTrue(expected_event_path.exists())
 
     def test_sbom_version_tracks_only_significant_content(self) -> None:
         record = {

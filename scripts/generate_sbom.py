@@ -36,7 +36,6 @@ DEFAULT_MAPPING_PAYLOAD = ROOT / "mappings" / "auto.json"
 DEFAULT_LOCAL_CHANNEL = ROOT / "local-advisory-channel"
 DEFAULT_CHANNEL = "conda-forge"
 SBOM_INPUT_SCHEMA_VERSION = 1
-SBOM_VERSION_PREFIX = "v1"
 SBOM_RELEVANT_MAPPING_FIELDS = (
     "name",
     "version",
@@ -156,7 +155,7 @@ def sbom_version(
     )
     inputs_hash = _sha256(inputs)
     return (
-        f"{SBOM_VERSION_PREFIX}-{inputs_hash[:12]}",
+        inputs_hash,
         inputs_hash,
         mapping_sha256(mapping),
     )
@@ -482,12 +481,6 @@ def sbom_output_path(root: Path, *, subdir: str, filename: str, version: str) ->
     )
 
 
-def sbom_event_path(root: Path, *, subdir: str, filename: str, version: str) -> Path:
-    return default_output_path(root, subdir=subdir, filename=filename) / (
-        f"event-{version}.json"
-    )
-
-
 def expected_sbom_artifact_paths(
     *,
     mapping: dict[str, Any],
@@ -506,18 +499,11 @@ def expected_sbom_artifact_paths(
     )
     return [
         sbom_output_path(root, subdir=subdir, filename=filename, version=version),
-        sbom_event_path(root, subdir=subdir, filename=filename, version=version),
     ]
 
 
 def sbom_artifact_paths(sbom_path: Path) -> list[Path]:
-    paths = [sbom_path]
-    if sbom_path.name.startswith("sbom-") and sbom_path.name.endswith(".cdx.json"):
-        version = sbom_path.name.removeprefix("sbom-").removesuffix(".cdx.json")
-        event_path = sbom_path.with_name(f"event-{version}.json")
-        if event_path.exists():
-            paths.append(event_path)
-    return paths
+    return [sbom_path]
 
 
 def get_sbom_version(sbom: dict[str, Any]) -> str:
@@ -537,47 +523,6 @@ def get_sbom_version(sbom: dict[str, Any]) -> str:
     raise SbomError("SBOM is missing sbom-generator:version")
 
 
-def _get_component_property(component: dict[str, Any], name: str) -> str | None:
-    for prop in component.get("properties") or []:
-        if isinstance(prop, dict) and prop.get("name") == name:
-            value = prop.get("value")
-            return value if isinstance(value, str) else None
-    return None
-
-
-def sbom_event(
-    *,
-    sbom: dict[str, Any],
-    sbom_path: Path,
-    channel_root: Path,
-    subdir: str,
-    filename: str,
-) -> dict[str, Any]:
-    metadata = sbom.get("metadata")
-    component = metadata.get("component") if isinstance(metadata, dict) else None
-    if not isinstance(component, dict):
-        raise SbomError("SBOM metadata.component is missing")
-    version = get_sbom_version(sbom)
-    return {
-        "schema_version": 1,
-        "event": "sbom_generated",
-        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "subdir": subdir,
-        "filename": filename,
-        "package": component.get("name"),
-        "version": component.get("version"),
-        "sbom_version": version,
-        "sbom_path": str(sbom_path.relative_to(channel_root)),
-        "mapping_sha256": _get_component_property(
-            component, "purl-associator:mapping-sha256"
-        ),
-        "input_sha256": _get_component_property(
-            component, "sbom-generator:input-sha256"
-        ),
-        "subject_purl": component.get("purl"),
-    }
-
-
 def write_versioned_sbom(
     *,
     sbom: dict[str, Any],
@@ -587,26 +532,12 @@ def write_versioned_sbom(
 ) -> tuple[Path, bool]:
     version = get_sbom_version(sbom)
     out = sbom_output_path(root, subdir=subdir, filename=filename, version=version)
-    event_out = sbom_event_path(root, subdir=subdir, filename=filename, version=version)
     if out.exists():
         LOGGER.info("SBOM version already exists path=%s", out)
         return out, False
-    LOGGER.info(
-        "writing SBOM artifact path=%s event_path=%s version=%s",
-        out,
-        event_out,
-        version,
-    )
+    LOGGER.info("writing SBOM artifact path=%s version=%s", out, version)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(sbom, indent=2) + "\n")
-    event = sbom_event(
-        sbom=sbom,
-        sbom_path=out,
-        channel_root=root,
-        subdir=subdir,
-        filename=filename,
-    )
-    event_out.write_text(json.dumps(event, indent=2) + "\n")
     return out, True
 
 

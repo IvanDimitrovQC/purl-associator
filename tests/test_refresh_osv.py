@@ -60,7 +60,7 @@ class RefreshOsvTests(unittest.TestCase):
                 / "noarch"
                 / "sboms"
                 / "demo-1.2.3-py_0.conda"
-                / "sbom-v1-abc123def456.cdx.json"
+                / "sbom-abc123def456.cdx.json"
             )
             sbom_path.parent.mkdir(parents=True)
             sbom_path.write_text(json.dumps(self._sbom()) + "\n")
@@ -94,7 +94,7 @@ class RefreshOsvTests(unittest.TestCase):
         self.assertEqual(first.existing, 0)
         self.assertEqual(second.written, 0)
         self.assertEqual(second.existing, 1)
-        self.assertTrue(first.outputs[0].name.startswith("osv-v1-abc123def456-"))
+        self.assertTrue(first.outputs[0].name.startswith("osv-abc123def456-"))
         self.assertEqual(published, first.outputs)
         self.assertEqual(progress_data["counts"]["processed"], 1)
 
@@ -106,7 +106,7 @@ class RefreshOsvTests(unittest.TestCase):
                 / "noarch"
                 / "advisories"
                 / "demo-1.2.3-py_0.conda"
-                / "osv-v1-abc123def456-fedcba654321.json"
+                / "osv-abc123def456-fedcba654321.json"
             )
             inventory_path = Path(tmp) / "inventory.json"
             inventory_path.write_text(
@@ -116,7 +116,7 @@ class RefreshOsvTests(unittest.TestCase):
                         "objects": [
                             (
                                 "noarch/advisories/demo-1.2.3-py_0.conda/"
-                                "osv-v1-abc123def456-fedcba654321.json"
+                                "osv-abc123def456-fedcba654321.json"
                             )
                         ],
                     }
@@ -137,13 +137,13 @@ class RefreshOsvTests(unittest.TestCase):
         self.assertEqual(
             filter_s3_sbom_artifact_paths(
                 [
-                    "noarch/sboms/demo/sbom-v1-abc.cdx.json",
-                    "noarch/sboms/demo/event-v1-abc.json",
+                    "noarch/sboms/demo/sbom-abc.cdx.json",
+                    "noarch/sboms/demo/event-abc.json",
                     "noarch/advisory-repodata.json",
                     "channel-index.json",
                 ]
             ),
-            ["noarch/sboms/demo/sbom-v1-abc.cdx.json"],
+            ["noarch/sboms/demo/sbom-abc.cdx.json"],
         )
 
     def test_stage_s3_sboms_downloads_filtered_objects(self) -> None:
@@ -162,10 +162,10 @@ class RefreshOsvTests(unittest.TestCase):
                             "Contents": [
                                 {
                                     "Key": (
-                                        "prefix/noarch/sboms/demo/sbom-v1-abc.cdx.json"
+                                        "prefix/noarch/sboms/demo/sbom-abc.cdx.json"
                                     )
                                 },
-                                {"Key": ("prefix/noarch/sboms/demo/event-v1-abc.json")},
+                                {"Key": ("prefix/noarch/sboms/demo/event-abc.json")},
                             ]
                         }
                     ),
@@ -188,7 +188,7 @@ class RefreshOsvTests(unittest.TestCase):
 
             self.assertEqual(
                 staged,
-                [stage_root / "noarch" / "sboms" / "demo" / "sbom-v1-abc.cdx.json"],
+                [stage_root / "noarch" / "sboms" / "demo" / "sbom-abc.cdx.json"],
             )
             self.assertTrue(staged[0].exists())
 

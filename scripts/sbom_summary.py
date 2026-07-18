@@ -21,7 +21,6 @@ from scripts.s3_publish import (
 from scripts.s3_sbom_inventory import (
     filter_sbom_inventory_paths,
     is_sbom_artifact_path,
-    is_sbom_event_path,
 )
 
 DEFAULT_CHANNEL_ROOT = Path("local-advisory-channel")
@@ -48,7 +47,6 @@ class ArtifactSummary:
     version: str | None
     build: str | None
     sbom_versions: set[str] = field(default_factory=set)
-    event_versions: set[str] = field(default_factory=set)
 
 
 def _now() -> str:
@@ -86,13 +84,6 @@ def _sbom_version_from_path(path: str) -> str | None:
     return None
 
 
-def _event_version_from_path(path: str) -> str | None:
-    name = Path(path).name
-    if name.startswith("event-") and name.endswith(".json"):
-        return name.removeprefix("event-").removesuffix(".json")
-    return None
-
-
 def _artifact_key(path: str) -> tuple[str, str] | None:
     parts = Path(path).parts
     if len(parts) < 4 or parts[1] != "sboms":
@@ -103,10 +94,7 @@ def _artifact_key(path: str) -> tuple[str, str] | None:
 def local_sbom_paths(channel_root: Path) -> list[str]:
     if not channel_root.exists():
         return []
-    paths = [
-        *channel_root.glob("*/sboms/*/sbom-*.cdx.json"),
-        *channel_root.glob("*/sboms/*/event-*.json"),
-    ]
+    paths = [*channel_root.glob("*/sboms/*/sbom-*.cdx.json")]
     out: list[str] = []
     for path in paths:
         try:
@@ -159,9 +147,6 @@ def _sorted_list(values: set[str]) -> list[str]:
 
 
 def _artifact_payload(artifact: ArtifactSummary) -> dict[str, Any]:
-    complete_versions = artifact.sbom_versions & artifact.event_versions
-    missing_event_versions = artifact.sbom_versions - artifact.event_versions
-    event_without_sbom_versions = artifact.event_versions - artifact.sbom_versions
     return {
         "subdir": artifact.subdir,
         "filename": artifact.filename,
@@ -169,13 +154,7 @@ def _artifact_payload(artifact: ArtifactSummary) -> dict[str, Any]:
         "version": artifact.version,
         "build": artifact.build,
         "sbom_count": len(artifact.sbom_versions),
-        "event_count": len(artifact.event_versions),
-        "complete_pair_count": len(complete_versions),
-        "missing_event_count": len(missing_event_versions),
-        "event_without_sbom_count": len(event_without_sbom_versions),
         "sbom_versions": _sorted_list(artifact.sbom_versions),
-        "missing_event_versions": _sorted_list(missing_event_versions),
-        "event_without_sbom_versions": _sorted_list(event_without_sbom_versions),
     }
 
 
@@ -183,10 +162,6 @@ def _empty_package_summary() -> dict[str, Any]:
     return {
         "artifact_count": 0,
         "sbom_count": 0,
-        "event_count": 0,
-        "complete_pair_count": 0,
-        "missing_event_count": 0,
-        "event_without_sbom_count": 0,
         "subdirs": set(),
         "versions": {},
     }
@@ -196,10 +171,6 @@ def _empty_version_summary() -> dict[str, Any]:
     return {
         "artifact_count": 0,
         "sbom_count": 0,
-        "event_count": 0,
-        "complete_pair_count": 0,
-        "missing_event_count": 0,
-        "event_without_sbom_count": 0,
         "subdirs": set(),
     }
 
@@ -211,24 +182,13 @@ def _add_artifact_to_package(
         return
     package = packages.setdefault(artifact.package, _empty_package_summary())
     version = package["versions"].setdefault(artifact.version, _empty_version_summary())
-    complete_versions = artifact.sbom_versions & artifact.event_versions
-    missing_event_versions = artifact.sbom_versions - artifact.event_versions
-    event_without_sbom_versions = artifact.event_versions - artifact.sbom_versions
 
     package["artifact_count"] += 1 if artifact.sbom_versions else 0
     package["sbom_count"] += len(artifact.sbom_versions)
-    package["event_count"] += len(artifact.event_versions)
-    package["complete_pair_count"] += len(complete_versions)
-    package["missing_event_count"] += len(missing_event_versions)
-    package["event_without_sbom_count"] += len(event_without_sbom_versions)
     package["subdirs"].add(artifact.subdir)
 
     version["artifact_count"] += 1 if artifact.sbom_versions else 0
     version["sbom_count"] += len(artifact.sbom_versions)
-    version["event_count"] += len(artifact.event_versions)
-    version["complete_pair_count"] += len(complete_versions)
-    version["missing_event_count"] += len(missing_event_versions)
-    version["event_without_sbom_count"] += len(event_without_sbom_versions)
     version["subdirs"].add(artifact.subdir)
 
 
@@ -259,21 +219,10 @@ def _subdir_counts(artifacts: list[ArtifactSummary]) -> dict[str, dict[str, int]
             {
                 "artifact_count": 0,
                 "sbom_count": 0,
-                "event_count": 0,
-                "complete_pair_count": 0,
-                "missing_event_count": 0,
-                "event_without_sbom_count": 0,
             },
         )
-        complete_versions = artifact.sbom_versions & artifact.event_versions
-        missing_event_versions = artifact.sbom_versions - artifact.event_versions
-        event_without_sbom_versions = artifact.event_versions - artifact.sbom_versions
         item["artifact_count"] += 1 if artifact.sbom_versions else 0
         item["sbom_count"] += len(artifact.sbom_versions)
-        item["event_count"] += len(artifact.event_versions)
-        item["complete_pair_count"] += len(complete_versions)
-        item["missing_event_count"] += len(missing_event_versions)
-        item["event_without_sbom_count"] += len(event_without_sbom_versions)
     return dict(sorted(subdirs.items()))
 
 
@@ -296,10 +245,6 @@ def sbom_summary_payload(
             version = _sbom_version_from_path(path)
             if version:
                 artifact.sbom_versions.add(version)
-        elif is_sbom_event_path(path):
-            version = _event_version_from_path(path)
-            if version:
-                artifact.event_versions.add(version)
 
     artifacts = sorted(groups.values(), key=lambda item: (item.subdir, item.filename))
     packages: dict[str, dict[str, Any]] = {}
@@ -307,32 +252,18 @@ def sbom_summary_payload(
         _add_artifact_to_package(packages, artifact)
 
     sbom_count = sum(len(artifact.sbom_versions) for artifact in artifacts)
-    event_count = sum(len(artifact.event_versions) for artifact in artifacts)
-    complete_pair_count = sum(
-        len(artifact.sbom_versions & artifact.event_versions) for artifact in artifacts
-    )
-    missing_event_count = sum(
-        len(artifact.sbom_versions - artifact.event_versions) for artifact in artifacts
-    )
-    event_without_sbom_count = sum(
-        len(artifact.event_versions - artifact.sbom_versions) for artifact in artifacts
-    )
     artifact_count = sum(1 for artifact in artifacts if artifact.sbom_versions)
     unparsed_artifact_count = sum(
         1 for artifact in artifacts if artifact.sbom_versions and not artifact.package
     )
 
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": _now(),
         "source": source,
-        "object_count": sbom_count + event_count,
+        "object_count": sbom_count,
         "sbom_count": sbom_count,
-        "event_count": event_count,
         "artifact_count": artifact_count,
-        "complete_pair_count": complete_pair_count,
-        "missing_event_count": missing_event_count,
-        "event_without_sbom_count": event_without_sbom_count,
         "package_count": len(packages),
         "unparsed_artifact_count": unparsed_artifact_count,
         "ignored_path_count": ignored,
@@ -343,7 +274,7 @@ def sbom_summary_payload(
         payload["artifacts"] = [
             _artifact_payload(artifact)
             for artifact in artifacts
-            if artifact.sbom_versions or artifact.event_versions
+            if artifact.sbom_versions
         ]
     return payload
 

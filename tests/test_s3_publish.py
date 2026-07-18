@@ -61,7 +61,7 @@ class S3PublishTests(unittest.TestCase):
     def test_s3_uri_for_path_preserves_channel_relative_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "local-advisory-channel"
-            path = root / "noarch" / "sboms" / "demo" / "sbom-v1-abcd.cdx.json"
+            path = root / "noarch" / "sboms" / "demo" / "sbom-abcd.cdx.json"
 
             destination = s3_uri_for_path(
                 local_path=path,
@@ -71,16 +71,16 @@ class S3PublishTests(unittest.TestCase):
 
         self.assertEqual(
             destination,
-            "s3://demo-bucket/prefix/noarch/sboms/demo/sbom-v1-abcd.cdx.json",
+            "s3://demo-bucket/prefix/noarch/sboms/demo/sbom-abcd.cdx.json",
         )
 
     def test_s3_uri_for_relative_path_preserves_channel_relative_path(self) -> None:
         self.assertEqual(
             s3_uri_for_relative_path(
-                relative_path="noarch/sboms/demo/sbom-v1-abcd.cdx.json",
+                relative_path="noarch/sboms/demo/sbom-abcd.cdx.json",
                 s3_uri="s3://demo-bucket/prefix",
             ),
-            "s3://demo-bucket/prefix/noarch/sboms/demo/sbom-v1-abcd.cdx.json",
+            "s3://demo-bucket/prefix/noarch/sboms/demo/sbom-abcd.cdx.json",
         )
 
     def test_upload_file_dry_run_does_not_require_existing_file(self) -> None:
@@ -199,7 +199,7 @@ class S3PublishTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "stage"
             result = download_file(
-                relative_path="noarch/sboms/demo/sbom-v1-abcd.cdx.json",
+                relative_path="noarch/sboms/demo/sbom-abcd.cdx.json",
                 root=root,
                 s3_uri="s3://demo-bucket/prefix",
                 runner=runner,
@@ -207,11 +207,11 @@ class S3PublishTests(unittest.TestCase):
 
         self.assertEqual(
             result.s3_uri,
-            "s3://demo-bucket/prefix/noarch/sboms/demo/sbom-v1-abcd.cdx.json",
+            "s3://demo-bucket/prefix/noarch/sboms/demo/sbom-abcd.cdx.json",
         )
         self.assertEqual(
             result.local_path,
-            root / "noarch" / "sboms" / "demo" / "sbom-v1-abcd.cdx.json",
+            root / "noarch" / "sboms" / "demo" / "sbom-abcd.cdx.json",
         )
         self.assertEqual(len(calls), 1)
         self.assertIn("cp", calls[0])
@@ -229,8 +229,8 @@ class S3PublishTests(unittest.TestCase):
             root = Path(tmp) / "stage"
             summary = download_files(
                 relative_paths=[
-                    "noarch/sboms/first/sbom-v1-first.cdx.json",
-                    "noarch/sboms/second/sbom-v1-second.cdx.json",
+                    "noarch/sboms/first/sbom-first.cdx.json",
+                    "noarch/sboms/second/sbom-second.cdx.json",
                 ],
                 root=root,
                 s3_uri="s3://demo-bucket/prefix",

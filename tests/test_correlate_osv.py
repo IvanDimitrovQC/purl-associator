@@ -107,12 +107,12 @@ class CorrelateOsvTests(unittest.TestCase):
             default_output_path(
                 Path(
                     "local-advisory-channel/noarch/sboms/"
-                    "demo-1.2.3-py_0.conda/sbom-v1-abc123def456.cdx.json"
+                    "demo-1.2.3-py_0.conda/sbom-abc123def456.cdx.json"
                 )
             ),
             Path(
                 "local-advisory-channel/noarch/advisories/"
-                "demo-1.2.3-py_0.conda/osv-v1-abc123def456.json"
+                "demo-1.2.3-py_0.conda/osv-abc123def456.json"
             ),
         )
 
@@ -129,13 +129,13 @@ class CorrelateOsvTests(unittest.TestCase):
             versioned_output_path(
                 Path(
                     "local-advisory-channel/noarch/sboms/"
-                    "demo-1.2.3-py_0.conda/sbom-v1-abc123def456.cdx.json"
+                    "demo-1.2.3-py_0.conda/sbom-abc123def456.cdx.json"
                 ),
                 advisory,
             ),
             Path(
                 "local-advisory-channel/noarch/advisories/"
-                f"demo-1.2.3-py_0.conda/osv-v1-abc123def456-{advisory_hash}.json"
+                f"demo-1.2.3-py_0.conda/osv-abc123def456-{advisory_hash}.json"
             ),
         )
 
@@ -159,7 +159,7 @@ class CorrelateOsvTests(unittest.TestCase):
         self.assertEqual(first_path, second_path)
         self.assertTrue(first_created)
         self.assertFalse(second_created)
-        self.assertEqual(written["correlation_version"][:3], "v1-")
+        self.assertRegex(written["correlation_version"], r"^[0-9a-f]{64}$")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ class AdvisoryIndexTests(unittest.TestCase):
                     "purl": "pkg:conda/conda-forge/demo@1.2.3?subdir=noarch",
                     "properties": [
                         {"name": "conda:build", "value": "py_0"},
-                        {"name": "sbom-generator:version", "value": "v1-sbom123"},
+                        {"name": "sbom-generator:version", "value": "sbom123"},
                         {
                             "name": "sbom-generator:input-sha256",
                             "value": "a" * 64,
@@ -50,8 +50,8 @@ class AdvisoryIndexTests(unittest.TestCase):
     def _advisory(self) -> dict:
         return {
             "schema_version": 1,
-            "correlation_version": "v1-osv123",
-            "source_sbom": "noarch/sboms/demo/sbom-v1-sbom123.cdx.json",
+            "correlation_version": "osv123",
+            "source_sbom": "noarch/sboms/demo/sbom-sbom123.cdx.json",
             "subject": {
                 "name": "demo",
                 "version": "1.2.3",
@@ -71,10 +71,10 @@ class AdvisoryIndexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "local-advisory-channel"
             sbom_path = root / "noarch" / "sboms" / "demo.conda" / (
-                "sbom-v1-sbom123.cdx.json"
+                "sbom-sbom123.cdx.json"
             )
             advisory_path = root / "noarch" / "advisories" / "demo.conda" / (
-                "osv-v1-sbom123-osv123.json"
+                "osv-sbom123-osv123.json"
             )
             sbom_path.parent.mkdir(parents=True)
             advisory_path.parent.mkdir(parents=True)
@@ -102,7 +102,7 @@ class AdvisoryIndexTests(unittest.TestCase):
         self.assertEqual(channel_index["subdirs"]["noarch"]["package_count"], 1)
         self.assertTrue(channel_index["subdirs"]["noarch"]["sharded"])
         self.assertEqual(record["name"], "demo")
-        self.assertEqual(record["sbom"]["version"], "v1-sbom123")
+        self.assertEqual(record["sbom"]["version"], "sbom123")
         self.assertEqual(record["sbom"]["component_purls"], ["pkg:pypi/demo-pkg@1.2.3"])
         self.assertEqual(record["osv"]["status"], "vulnerabilities_found")
         self.assertEqual(record["osv"]["finding_ids"], ["GHSA-demo-0001"])
@@ -111,7 +111,7 @@ class AdvisoryIndexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "local-advisory-channel"
             sbom_path = root / "noarch" / "sboms" / "demo.conda" / (
-                "sbom-v1-sbom123.cdx.json"
+                "sbom-sbom123.cdx.json"
             )
             sbom_path.parent.mkdir(parents=True)
             sbom_path.write_text(json.dumps(self._sbom()) + "\n")
@@ -123,8 +123,8 @@ class AdvisoryIndexTests(unittest.TestCase):
         self.assertIn("demo.conda", state.subdirs["noarch"]["packages"])
 
     def test_build_indexes_from_s3_rebuilds_sharded_indexes(self) -> None:
-        sbom_path = "noarch/sboms/demo.conda/sbom-v1-sbom123.cdx.json"
-        advisory_path = "noarch/advisories/demo.conda/osv-v1-sbom123-osv123.json"
+        sbom_path = "noarch/sboms/demo.conda/sbom-sbom123.cdx.json"
+        advisory_path = "noarch/advisories/demo.conda/osv-sbom123-osv123.json"
         payloads = {
             f"s3://demo-bucket/prefix/{sbom_path}": self._sbom(),
             f"s3://demo-bucket/prefix/{advisory_path}": self._advisory(),
@@ -146,7 +146,7 @@ class AdvisoryIndexTests(unittest.TestCase):
                                 {
                                     "Key": (
                                         "prefix/noarch/sboms/demo.conda/"
-                                        "event-v1-sbom123.json"
+                                        "event-sbom123.json"
                                     )
                                 },
                                 {"Key": f"prefix/{advisory_path}"},

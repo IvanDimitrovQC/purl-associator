@@ -22,29 +22,18 @@ def is_sbom_artifact_path(path: str) -> bool:
     return "/sboms/" in path and name.startswith("sbom-") and name.endswith(".cdx.json")
 
 
-def is_sbom_event_path(path: str) -> bool:
-    name = Path(path).name
-    return "/sboms/" in path and name.startswith("event-") and name.endswith(".json")
-
-
 def filter_sbom_inventory_paths(paths: list[str]) -> list[str]:
-    return sorted(
-        path
-        for path in dict.fromkeys(paths)
-        if is_sbom_artifact_path(path) or is_sbom_event_path(path)
-    )
+    return sorted(path for path in dict.fromkeys(paths) if is_sbom_artifact_path(path))
 
 
 def sbom_inventory_payload(*, s3_uri: str, object_paths: list[str]) -> dict[str, Any]:
     sbom_count = sum(1 for path in object_paths if is_sbom_artifact_path(path))
-    event_count = sum(1 for path in object_paths if is_sbom_event_path(path))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "s3_uri": s3_uri,
         "object_count": len(object_paths),
         "sbom_count": sbom_count,
-        "event_count": event_count,
         "objects": object_paths,
     }
 
@@ -96,16 +85,13 @@ def main() -> None:
 
     print(out)
     print(
-        "wrote S3 SBOM inventory "
-        f"with {payload['sbom_count']} SBOM(s), "
-        f"{payload['event_count']} event file(s)",
+        f"wrote S3 SBOM inventory with {payload['sbom_count']} SBOM(s)",
         file=sys.stderr,
     )
     LOGGER.info(
-        "completed S3 SBOM inventory out=%s sboms=%d events=%d objects=%d",
+        "completed S3 SBOM inventory out=%s sboms=%d objects=%d",
         out,
         payload["sbom_count"],
-        payload["event_count"],
         payload["object_count"],
     )
     print_log_location(log_path)
