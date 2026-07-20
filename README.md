@@ -416,8 +416,29 @@ rows include OSV IDs, component PURLs, and canonical OSV URLs; URLs are derived
 from the ID when reading older schema version 1 advisory artifacts. Summary
 payloads with vulnerability URLs use schema version 2.
 
-To build the static data file consumed by the local dashboard, merge the S3
-advisory indexes, the PURL mapping, and the local OSV vulnerability summary:
+To build the static data file consumed by the local dashboard from mutable S3
+indexes/shards only, skip the OSV summary scan:
+
+```sh
+pixi run -e lite advisory:dashboard-data \
+  --s3-uri s3://<bucket>/<prefix> \
+  --s3-profile <profile> \
+  --s3-region <region> \
+  --mapping-json mappings/auto.json \
+  --skip-osv-summary \
+  --out web/public/advisory-dashboard-data.json \
+  --s3-output-uri s3://<bucket>/temp \
+  --workers 8
+```
+
+This is the fast path for dashboard generation. It reads `channel-index.json`,
+the subdir shard indexes, package-name shards, and the PURL mapping, but does
+not stream every OSV artifact. Indexes produced by the current code include
+compact vulnerability rows under each current OSV record; older indexes still
+work, but vulnerability drilldowns fall back to OSV IDs from `finding_ids`.
+
+To build the dashboard from a separately generated local OSV vulnerability
+summary instead:
 
 ```sh
 pixi run -e lite advisory:dashboard-data \
@@ -435,12 +456,13 @@ The dashboard payload includes package-level flags such as `missing_purl`,
 `has_sbom`, `missing_osv`, `vulnerabilities_found`,
 `no_known_vulnerabilities`, and latest-indexed-version flags. It also keeps the
 artifact rows needed to drill down by version, platform subdir, and build. When
-OSV findings are present, their IDs link to the corresponding OSV page. Dashboard
-payloads with vulnerability URLs use schema version 2. When `--s3-output-uri` is
-set, the generated dashboard JSON is uploaded to that separate S3 prefix using
-the local output filename. This lets the dashboard read advisory-channel data
-from one prefix, such as `s3://<bucket>/test1`, while publishing the handoff JSON
-to another prefix, such as `s3://<bucket>/temp/advisory-dashboard-data.json`.
+OSV findings are present, their IDs link to the corresponding OSV page, and
+newer index/summary inputs can include severity metadata. Dashboard payloads use
+schema version 2. When `--s3-output-uri` is set, the generated dashboard JSON is
+uploaded to that separate S3 prefix using the local output filename. This lets
+the dashboard read advisory-channel data from one prefix, such as
+`s3://<bucket>/test1`, while publishing the handoff JSON to another prefix, such
+as `s3://<bucket>/temp/advisory-dashboard-data.json`.
 
 S3 keys preserve the local channel-relative path. For example:
 

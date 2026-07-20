@@ -16,6 +16,7 @@ from typing import Any
 
 from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
 from scripts.generate_sbom import DEFAULT_CHANNEL, DEFAULT_LOCAL_CHANNEL
+from scripts.osv_vulnerability_summary import vulnerabilities_from_advisory_payload
 from scripts.s3_osv_inventory import filter_osv_inventory_paths
 from scripts.s3_publish import (
     Runner,
@@ -223,6 +224,10 @@ def advisory_index_update_from_data(
     subdir = _artifact_subdir(path)
     filename = _artifact_filename(path)
     finding_ids = _finding_ids(advisory)
+    vulnerabilities = vulnerabilities_from_advisory_payload(
+        advisory,
+        path=relative_path,
+    )
     osv = {
         "current": relative_path,
         "correlation_version": advisory.get("correlation_version"),
@@ -231,6 +236,8 @@ def advisory_index_update_from_data(
         "finding_ids": finding_ids,
         "status": _osv_status(advisory),
     }
+    if vulnerabilities:
+        osv["vulnerabilities"] = vulnerabilities
     generated_at = advisory.get("generated_at")
     if isinstance(generated_at, str):
         osv["generated_at"] = generated_at

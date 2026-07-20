@@ -62,7 +62,24 @@ class AdvisoryIndexTests(unittest.TestCase):
             "findings": [
                 {
                     "component_purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "component_name": "demo-pkg",
+                    "component_version": "1.2.3",
                     "vulnerability_id": "GHSA-demo-0001",
+                    "modified": "2026-01-01T00:00:00Z",
+                }
+            ],
+            "components": [
+                {
+                    "name": "demo-pkg",
+                    "version": "1.2.3",
+                    "purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "vulnerabilities": [
+                        {
+                            "id": "GHSA-demo-0001",
+                            "modified": "2026-01-01T00:00:00Z",
+                            "database_specific": {"severity": "MODERATE"},
+                        }
+                    ],
                 }
             ],
         }
@@ -106,6 +123,8 @@ class AdvisoryIndexTests(unittest.TestCase):
         self.assertEqual(record["sbom"]["component_purls"], ["pkg:pypi/demo-pkg@1.2.3"])
         self.assertEqual(record["osv"]["status"], "vulnerabilities_found")
         self.assertEqual(record["osv"]["finding_ids"], ["GHSA-demo-0001"])
+        self.assertEqual(record["osv"]["vulnerabilities"][0]["id"], "GHSA-demo-0001")
+        self.assertEqual(record["osv"]["vulnerabilities"][0]["severity"], "MEDIUM")
 
     def test_advisory_index_state_loads_sharded_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

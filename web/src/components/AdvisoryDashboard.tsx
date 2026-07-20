@@ -10,6 +10,34 @@ import { useAdvisoryDashboardData } from "../data/useAdvisoryDashboardData";
 import { ConfidenceBar, Glyph, PurlChip, Theme } from "./Primitives";
 
 type StatusTone = "good" | "bad" | "warn" | "muted";
+type PackageStatusFilter =
+  | "all"
+  | "latest_vulnerable"
+  | "previous_vulnerable"
+  | "any_vulnerable"
+  | "osv_missing"
+  | "osv_partial"
+  | "no_known_vulnerabilities"
+  | "sbom_missing"
+  | "missing_purl";
+
+const PACKAGE_STATUS_FILTERS: Array<{
+  value: PackageStatusFilter;
+  label: string;
+}> = [
+  { value: "all", label: "All statuses" },
+  { value: "latest_vulnerable", label: "Latest vuln" },
+  { value: "previous_vulnerable", label: "Previous vuln" },
+  { value: "any_vulnerable", label: "Any vuln" },
+  { value: "osv_missing", label: "OSV missing" },
+  { value: "osv_partial", label: "OSV partial" },
+  { value: "no_known_vulnerabilities", label: "No vulns" },
+  { value: "sbom_missing", label: "SBOM missing" },
+  { value: "missing_purl", label: "Missing PURL" },
+];
+
+const DASHBOARD_GRID_COLUMNS = "310px 160px 150px 270px minmax(360px, 1fr)";
+const DRILLDOWN_ROW_HEIGHT = 46;
 
 function uniqueSorted(values: Array<string | null | undefined>): string[] {
   return Array.from(new Set(values.filter((value): value is string => Boolean(value))))
@@ -20,21 +48,139 @@ function versionKey(version: string | null): string {
   return version ?? "unknown";
 }
 
+function artifactVulnerabilityCount(artifact: DashboardArtifact): number {
+  return artifact.osv.vulnerability_count ?? artifact.vulnerabilities.length;
+}
+
+function latestVersion(pkg: DashboardPackage): string | null {
+  return pkg.latest_version ?? pkg.osv.latest_version;
+}
+
+function latestVersionArtifacts(pkg: DashboardPackage): DashboardArtifact[] {
+  const latest = latestVersion(pkg);
+  if (!latest) return [];
+  return pkg.artifacts.filter(
+    (artifact) => versionKey(artifact.version) === versionKey(latest),
+  );
+}
+
+function latestVersionVulnerabilityCount(pkg: DashboardPackage): number {
+  if (typeof pkg.osv.latest_version_total_vulnerability_findings === "number") {
+    return pkg.osv.latest_version_total_vulnerability_findings;
+  }
+  return latestVersionArtifacts(pkg).reduce(
+    (total, artifact) => total + artifactVulnerabilityCount(artifact),
+    0,
+  );
+}
+
+function latestVersionFullyChecked(pkg: DashboardPackage): boolean {
+  if (typeof pkg.osv.latest_version_all_checked === "boolean") {
+    return pkg.osv.latest_version_all_checked;
+  }
+  const artifacts = latestVersionArtifacts(pkg);
+  return artifacts.length > 0 && artifacts.every((artifact) => artifact.osv.exists);
+}
+
+function latestVersionHasVulnerabilities(pkg: DashboardPackage): boolean {
+  return (
+    pkg.flags.includes("latest_version_vulnerabilities_found") ||
+    pkg.osv.latest_version_any_vulnerabilities_found ||
+    latestVersionVulnerabilityCount(pkg) > 0
+  );
+}
+
+function previousVersionVulnerabilityCount(pkg: DashboardPackage): number {
+  const latest = latestVersion(pkg);
+  if (!latest) {
+    return 0;
+  }
+  const previousArtifacts = pkg.artifacts.filter(
+    (artifact) => versionKey(artifact.version) !== versionKey(latest),
+  );
+  return previousArtifacts.reduce(
+    (total, artifact) => total + artifactVulnerabilityCount(artifact),
+    0,
+  );
+}
+
+function previousVersionOnlyHasVulnerabilities(pkg: DashboardPackage): boolean {
+  return (
+    previousVersionVulnerabilityCount(pkg) > 0 &&
+    !latestVersionHasVulnerabilities(pkg) &&
+    latestVersionFullyChecked(pkg)
+  );
+}
+
 function statusTone(pkg: DashboardPackage): StatusTone {
-  if (pkg.flags.includes("vulnerabilities_found")) return "bad";
+  if (latestVersionHasVulnerabilities(pkg)) return "bad";
+  if (previousVersionOnlyHasVulnerabilities(pkg)) return "warn";
   if (pkg.flags.includes("missing_osv") || pkg.flags.includes("partial_osv"))
     return "warn";
+  if (pkg.flags.includes("vulnerabilities_found")) return "warn";
   if (pkg.flags.includes("no_known_vulnerabilities")) return "good";
   return "muted";
 }
 
 function statusLabel(pkg: DashboardPackage): string {
-  if (pkg.flags.includes("vulnerabilities_found")) return "Vulnerable";
+  if (latestVersionHasVulnerabilities(pkg)) return "Latest vulnerable";
+  if (previousVersionOnlyHasVulnerabilities(pkg)) return "Previous vulnerable";
   if (pkg.flags.includes("missing_osv")) return "OSV missing";
   if (pkg.flags.includes("partial_osv")) return "OSV partial";
+  if (pkg.flags.includes("vulnerabilities_found")) return "Vuln found";
   if (pkg.flags.includes("no_known_vulnerabilities")) return "No known vulns";
   if (pkg.flags.includes("missing_sbom")) return "SBOM missing";
   return "Indexed";
+}
+
+function severityTone(severity: string | null | undefined): StatusTone {
+  const normalized = severity?.toUpperCase();
+  if (normalized === "CRITICAL" || normalized === "HIGH") return "bad";
+  if (normalized === "MEDIUM") return "warn";
+  if (normalized === "LOW" || normalized === "NONE") return "good";
+  return "muted";
+}
+
+function severityLabel(severity: string | null | undefined): string {
+  if (!severity) return "Unknown";
+  return severity.toUpperCase();
+}
+
+function severityTitle(vuln: AdvisoryVulnerability): string {
+  const pieces = [`Severity: ${severityLabel(vuln.severity)}`];
+  if (typeof vuln.severity_score === "number") {
+    pieces.push(`score ${vuln.severity_score.toFixed(1)}`);
+  }
+  if (vuln.severity_source) {
+    pieces.push(`source ${vuln.severity_source}`);
+  }
+  if (vuln.severity_vector) {
+    pieces.push(vuln.severity_vector);
+  }
+  return pieces.join(" · ");
+}
+
+function matchesStatusFilter(
+  pkg: DashboardPackage,
+  filter: PackageStatusFilter,
+): boolean {
+  if (filter === "all") return true;
+  if (filter === "latest_vulnerable") {
+    return latestVersionHasVulnerabilities(pkg);
+  }
+  if (filter === "previous_vulnerable") {
+    return previousVersionOnlyHasVulnerabilities(pkg);
+  }
+  if (filter === "any_vulnerable") {
+    return pkg.flags.includes("vulnerabilities_found");
+  }
+  if (filter === "osv_missing") return pkg.flags.includes("missing_osv");
+  if (filter === "osv_partial") return pkg.flags.includes("partial_osv");
+  if (filter === "no_known_vulnerabilities") {
+    return pkg.flags.includes("no_known_vulnerabilities");
+  }
+  if (filter === "sbom_missing") return pkg.flags.includes("missing_sbom");
+  return pkg.flags.includes("missing_purl");
 }
 
 function toneColors(theme: Theme, tone: StatusTone): { bg: string; fg: string } {
@@ -93,7 +239,7 @@ function Badge({
   );
 }
 
-function Metric({
+function SummaryMetric({
   label,
   value,
   theme,
@@ -106,13 +252,7 @@ function Metric({
 }) {
   const c = toneColors(theme, tone);
   return (
-    <div
-      style={{
-        minWidth: 120,
-        padding: "8px 10px",
-        borderRight: `1px solid ${theme.t.border}`,
-      }}
-    >
+    <div style={{ minWidth: 0 }}>
       <div
         style={{
           color: theme.t.fg2,
@@ -127,13 +267,42 @@ function Metric({
         style={{
           color: tone === "muted" ? theme.t.fg1 : c.fg,
           fontVariantNumeric: "tabular-nums",
-          fontSize: 20,
+          fontSize: 19,
           fontWeight: 700,
           marginTop: 2,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
         }}
       >
         {typeof value === "number" ? value.toLocaleString() : value}
       </div>
+    </div>
+  );
+}
+
+function SummaryCell({
+  children,
+  theme,
+  columns = 1,
+}: {
+  children: ReactNode;
+  theme: Theme;
+  columns?: number;
+}) {
+  return (
+    <div
+      style={{
+        minWidth: 0,
+        padding: "8px 10px",
+        borderRight: `1px solid ${theme.t.border}`,
+        display: "grid",
+        gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+        gap: 10,
+        alignItems: "center",
+      }}
+    >
+      {children}
     </div>
   );
 }
@@ -189,7 +358,7 @@ function SelectorColumn({
                 onClick={() => onSelect(item)}
                 style={{
                   width: "100%",
-                  height: 34,
+                  height: DRILLDOWN_ROW_HEIGHT,
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "space-between",
@@ -273,7 +442,7 @@ function ArtifactList({
                 onClick={() => onSelect(artifact.filename)}
                 style={{
                   width: "100%",
-                  minHeight: 46,
+                  height: DRILLDOWN_ROW_HEIGHT,
                   display: "grid",
                   gridTemplateColumns: "minmax(0, 1fr) auto",
                   gap: 8,
@@ -427,33 +596,55 @@ function VulnerabilityList({
               marginBottom: 5,
             }}
           >
-            {vuln.url ? (
-              <a
-                href={vuln.url}
-                target="_blank"
-                rel="noreferrer"
-                style={{
-                  fontFamily: "JetBrains Mono, monospace",
-                  fontWeight: 700,
-                  color: theme.t.bad,
-                  fontSize: 12,
-                  textDecoration: "none",
-                }}
-              >
-                {vuln.id ?? "unknown"}
-              </a>
-            ) : (
-              <span
-                style={{
-                  fontFamily: "JetBrains Mono, monospace",
-                  fontWeight: 700,
-                  color: theme.t.bad,
-                  fontSize: 12,
-                }}
-              >
-                {vuln.id ?? "unknown"}
+            <div
+              style={{
+                minWidth: 0,
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+              }}
+            >
+              {vuln.url ? (
+                <a
+                  href={vuln.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontWeight: 700,
+                    color: theme.t.bad,
+                    fontSize: 12,
+                    textDecoration: "none",
+                  }}
+                >
+                  {vuln.id ?? "unknown"}
+                </a>
+              ) : (
+                <span
+                  style={{
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontWeight: 700,
+                    color: theme.t.bad,
+                    fontSize: 12,
+                  }}
+                >
+                  {vuln.id ?? "unknown"}
+                </span>
+              )}
+              <span title={severityTitle(vuln)}>
+                <Badge theme={theme} tone={severityTone(vuln.severity)}>
+                  {severityLabel(vuln.severity)}
+                </Badge>
               </span>
-            )}
+            </div>
             <span style={{ color: theme.t.fg3, fontSize: 11 }}>
               {vuln.modified ?? ""}
             </span>
@@ -465,13 +656,308 @@ function VulnerabilityList({
   );
 }
 
+function versionFindingRows(pkg: DashboardPackage): Array<{
+  version: string;
+  artifactCount: number;
+  checkedCount: number;
+  findingCount: number;
+}> {
+  return uniqueSorted(pkg.artifacts.map((artifact) => artifact.version))
+    .reverse()
+    .map((version) => {
+      const artifacts = pkg.artifacts.filter(
+        (artifact) => versionKey(artifact.version) === version,
+      );
+      return {
+        version,
+        artifactCount: artifacts.length,
+        checkedCount: artifacts.filter((artifact) => artifact.osv.exists).length,
+        findingCount: artifacts.reduce(
+          (total, artifact) => total + artifactVulnerabilityCount(artifact),
+          0,
+        ),
+      };
+    });
+}
+
+function shortVersionLabel(version: string): string {
+  return version.length > 12 ? `${version.slice(0, 11)}...` : version;
+}
+
+function VersionFindingsChart({
+  pkg,
+  selectedVersion,
+  onSelectVersion,
+  theme,
+}: {
+  pkg: DashboardPackage;
+  selectedVersion: string | null;
+  onSelectVersion: (version: string) => void;
+  theme: Theme;
+}) {
+  const rows = versionFindingRows(pkg).slice().reverse();
+  if (rows.length === 0) return null;
+  const maxFindings = Math.max(1, ...rows.map((row) => row.findingCount));
+  const chartWidth = Math.max(420, rows.length * 58 + 64);
+  const chartHeight = 176;
+  const margin = { top: 18, right: 18, bottom: 42, left: 34 };
+  const plotWidth = chartWidth - margin.left - margin.right;
+  const plotHeight = chartHeight - margin.top - margin.bottom;
+  const yTicks = Array.from(
+    new Set([0, Math.ceil(maxFindings / 2), maxFindings]),
+  );
+  const xForIndex = (index: number) =>
+    margin.left +
+    (rows.length === 1 ? plotWidth / 2 : (index / (rows.length - 1)) * plotWidth);
+  const yForCount = (count: number) =>
+    margin.top + plotHeight - (count / maxFindings) * plotHeight;
+  const checkedSegments: string[][] = [];
+  let currentSegment: string[] = [];
+  rows.forEach((row, index) => {
+    if (row.checkedCount === 0) {
+      if (currentSegment.length > 0) checkedSegments.push(currentSegment);
+      currentSegment = [];
+      return;
+    }
+    currentSegment.push(`${xForIndex(index)},${yForCount(row.findingCount)}`);
+  });
+  if (currentSegment.length > 0) checkedSegments.push(currentSegment);
+  return (
+    <section
+      style={{
+        padding: "10px 0 12px",
+        borderTop: `1px solid ${theme.t.border}`,
+        borderBottom: `1px solid ${theme.t.border}`,
+        marginBottom: 2,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          gap: 12,
+          marginBottom: 8,
+        }}
+      >
+        <div
+          style={{
+            color: theme.t.fg2,
+            fontSize: 11,
+            fontWeight: 700,
+            textTransform: "uppercase",
+          }}
+        >
+          Findings by version
+        </div>
+        <div
+          style={{
+            color: theme.t.fg3,
+            fontSize: 10.5,
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          {rows.length.toLocaleString()} versions
+        </div>
+      </div>
+      <div
+        style={{
+          overflowX: "auto",
+          overflowY: "hidden",
+          paddingBottom: 2,
+        }}
+      >
+        <svg
+          viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+          width={chartWidth}
+          height={chartHeight}
+          role="img"
+          aria-label={`${pkg.name} OSV findings by version`}
+          style={{ display: "block" }}
+        >
+          <line
+            x1={margin.left}
+            y1={margin.top}
+            x2={margin.left}
+            y2={margin.top + plotHeight}
+            stroke={theme.t.border}
+          />
+          {yTicks.map((tick) => {
+            const y = yForCount(tick);
+            return (
+              <g key={tick}>
+                <line
+                  x1={margin.left}
+                  y1={y}
+                  x2={margin.left + plotWidth}
+                  y2={y}
+                  stroke={theme.t.border}
+                  strokeDasharray={tick === 0 ? undefined : "3 4"}
+                />
+                <text
+                  x={margin.left - 8}
+                  y={y + 3}
+                  textAnchor="end"
+                  fill={theme.t.fg3}
+                  fontSize={10}
+                  fontFamily="JetBrains Mono, monospace"
+                >
+                  {tick}
+                </text>
+              </g>
+            );
+          })}
+          {checkedSegments.map((segment, index) => (
+            <polyline
+              key={index}
+              points={segment.join(" ")}
+              fill="none"
+              stroke={theme.t.bad}
+              strokeWidth={2}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              opacity={0.8}
+            />
+          ))}
+          {rows.map((row, index) => {
+            const x = xForIndex(index);
+            const checked = row.checkedCount > 0;
+            const y = checked ? yForCount(row.findingCount) : yForCount(0);
+            const active = versionKey(selectedVersion) === row.version;
+            const vulnerable = row.findingCount > 0;
+            const pointColor = !checked
+              ? theme.t.warn
+              : vulnerable
+                ? theme.t.bad
+                : theme.t.good;
+            const showVersionLabel =
+              rows.length <= 8 ||
+              active ||
+              index === 0 ||
+              index === rows.length - 1 ||
+              index % Math.ceil(rows.length / 6) === 0;
+            return (
+              <g
+                key={row.version}
+                onClick={() => onSelectVersion(row.version)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onSelectVersion(row.version);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                style={{ cursor: "pointer", outline: "none" }}
+              >
+                <title>
+                  {`${row.version}: ${
+                    checked ? row.findingCount : "missing OSV"
+                  } finding(s) across ${row.artifactCount} artifact(s)`}
+                </title>
+                <line
+                  x1={x}
+                  y1={margin.top + plotHeight}
+                  x2={x}
+                  y2={margin.top + plotHeight + 5}
+                  stroke={theme.t.border}
+                />
+                {active && (
+                  <line
+                    x1={x}
+                    y1={margin.top}
+                    x2={x}
+                    y2={margin.top + plotHeight}
+                    stroke={theme.t.accent}
+                    strokeDasharray="3 3"
+                    opacity={0.8}
+                  />
+                )}
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={active ? 6 : 4.5}
+                  fill={pointColor}
+                  stroke={active ? theme.t.accent : theme.t.page}
+                  strokeWidth={active ? 2.5 : 1.5}
+                />
+                {vulnerable && (
+                  <text
+                    x={x}
+                    y={Math.max(margin.top + 8, y - 10)}
+                    textAnchor="middle"
+                    fill={theme.t.bad}
+                    fontSize={10}
+                    fontWeight={700}
+                    fontFamily="JetBrains Mono, monospace"
+                  >
+                    {row.findingCount}
+                  </text>
+                )}
+                {showVersionLabel && (
+                  <text
+                    x={x}
+                    y={chartHeight - 14}
+                    textAnchor="middle"
+                    fill={active ? theme.t.fg1 : theme.t.fg3}
+                    fontSize={10}
+                    fontFamily="JetBrains Mono, monospace"
+                  >
+                    {shortVersionLabel(row.version)}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+          <text
+            x={chartWidth - margin.right}
+            y={chartHeight - 2}
+            textAnchor="end"
+            fill={theme.t.fg3}
+            fontSize={10}
+            fontFamily="JetBrains Mono, monospace"
+          >
+            latest
+          </text>
+        </svg>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(3, max-content)",
+            gap: 12,
+            marginTop: 6,
+            color: theme.t.fg3,
+            fontSize: 10.5,
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          <span>
+            Latest: {rows[rows.length - 1]?.version ?? "—"}
+          </span>
+          <span>
+            Max findings: {maxFindings}
+          </span>
+          <span>
+            Checked: {rows.filter((row) => row.checkedCount > 0).length}/
+            {rows.length}
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function ArtifactDetail({
   pkg,
   artifact,
+  selectedVersion,
+  onSelectVersion,
   theme,
 }: {
   pkg: DashboardPackage;
   artifact: DashboardArtifact | null;
+  selectedVersion: string | null;
+  onSelectVersion: (version: string) => void;
   theme: Theme;
 }) {
   if (!artifact) {
@@ -494,6 +980,12 @@ function ArtifactDetail({
         >
           {pkg.name}
         </h2>
+        <VersionFindingsChart
+          pkg={pkg}
+          selectedVersion={selectedVersion}
+          onSelectVersion={onSelectVersion}
+          theme={theme}
+        />
         <DetailRow label="PURL" theme={theme}>
           <PurlChip purl={pkg.mapped_purl} theme={theme} />
         </DetailRow>
@@ -555,6 +1047,12 @@ function ArtifactDetail({
         </Badge>
       </div>
 
+      <VersionFindingsChart
+        pkg={pkg}
+        selectedVersion={selectedVersion}
+        onSelectVersion={onSelectVersion}
+        theme={theme}
+      />
       <DetailRow label="Mapped PURL" theme={theme}>
         <PurlChip purl={pkg.mapped_purl} theme={theme} />
       </DetailRow>
@@ -609,6 +1107,7 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
   const { payload, packages, loadError } = useAdvisoryDashboardData();
   const t = theme.t;
   const [q, setQ] = useState("");
+  const [statusFilter, setStatusFilter] = useState<PackageStatusFilter>("all");
   const [selectedPackageName, setSelectedPackageName] = useState<string | null>(null);
   const [selectedVersion, setSelectedVersion] = useState<string | null>(null);
   const [selectedSubdir, setSelectedSubdir] = useState<string | null>(null);
@@ -617,21 +1116,48 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    const out = packages.filter((pkg) =>
-      needle ? pkg.name.toLowerCase().includes(needle) : true,
-    );
+    const out = packages.filter((pkg) => {
+      if (!matchesStatusFilter(pkg, statusFilter)) return false;
+      return needle ? pkg.name.toLowerCase().includes(needle) : true;
+    });
     out.sort((a, b) => {
+      const latestDelta =
+        Number(latestVersionHasVulnerabilities(b)) -
+        Number(latestVersionHasVulnerabilities(a));
+      if (latestDelta !== 0) return latestDelta;
+      const previousDelta =
+        Number(previousVersionOnlyHasVulnerabilities(b)) -
+        Number(previousVersionOnlyHasVulnerabilities(a));
+      if (previousDelta !== 0) return previousDelta;
       const av = a.osv.total_vulnerability_findings;
       const bv = b.osv.total_vulnerability_findings;
       if (av !== bv) return bv - av;
       return a.name.localeCompare(b.name);
     });
     return out;
-  }, [packages, q]);
+  }, [packages, q, statusFilter]);
+
+  const derivedCounts = useMemo(
+    () => ({
+      packagesWithLatestVersionVulnerabilities: packages.filter(
+        latestVersionHasVulnerabilities,
+      ).length,
+      packagesWithPreviousVersionVulnerabilities: packages.filter(
+        previousVersionOnlyHasVulnerabilities,
+      ).length,
+    }),
+    [packages],
+  );
 
   useEffect(() => {
-    if (!selectedPackageName && filtered.length > 0) {
-      setSelectedPackageName(filtered[0].name);
+    const selectedStillVisible = filtered.some(
+      (pkg) => pkg.name === selectedPackageName,
+    );
+    const nextPackageName = selectedStillVisible
+      ? selectedPackageName
+      : (filtered[0]?.name ?? null);
+    if (nextPackageName !== selectedPackageName) {
+      setSelectedPackageName(nextPackageName);
     }
   }, [filtered, selectedPackageName]);
 
@@ -734,37 +1260,58 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
     >
       <div
         style={{
-          display: "flex",
-          alignItems: "stretch",
+          display: "grid",
+          gridTemplateColumns: DASHBOARD_GRID_COLUMNS,
           borderBottom: `1px solid ${t.border}`,
           background: t.surface,
           minHeight: 62,
           flexShrink: 0,
         }}
       >
-        <Metric label="Packages" value={payload.counts.packages} theme={theme} />
-        <Metric label="Artifacts" value={payload.counts.artifacts} theme={theme} />
-        <Metric
-          label="OSV Checked"
-          value={payload.counts.packages_with_osv}
-          theme={theme}
-          tone="good"
-        />
-        <Metric
-          label="Vulnerable"
-          value={payload.counts.packages_with_vulnerabilities}
-          theme={theme}
-          tone="bad"
-        />
-        <Metric
-          label="Findings"
-          value={payload.counts.vulnerability_findings}
-          theme={theme}
-          tone="bad"
-        />
+        <SummaryCell theme={theme} columns={2}>
+          <SummaryMetric
+            label="Packages"
+            value={payload.counts.packages}
+            theme={theme}
+          />
+          <SummaryMetric
+            label="Artifacts"
+            value={payload.counts.artifacts}
+            theme={theme}
+          />
+        </SummaryCell>
+        <SummaryCell theme={theme}>
+          <SummaryMetric
+            label="OSV Checked"
+            value={payload.counts.packages_with_osv}
+            theme={theme}
+            tone="good"
+          />
+        </SummaryCell>
+        <SummaryCell theme={theme}>
+          <SummaryMetric
+            label="Latest Vuln"
+            value={derivedCounts.packagesWithLatestVersionVulnerabilities}
+            theme={theme}
+            tone="bad"
+          />
+        </SummaryCell>
+        <SummaryCell theme={theme} columns={2}>
+          <SummaryMetric
+            label="Previous Vuln"
+            value={derivedCounts.packagesWithPreviousVersionVulnerabilities}
+            theme={theme}
+            tone="warn"
+          />
+          <SummaryMetric
+            label="Findings"
+            value={payload.counts.vulnerability_findings}
+            theme={theme}
+            tone="bad"
+          />
+        </SummaryCell>
         <div
           style={{
-            marginLeft: "auto",
             padding: "10px 14px",
             color: t.fg2,
             fontSize: 11,
@@ -796,7 +1343,7 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
           flex: 1,
           minHeight: 0,
           display: "grid",
-          gridTemplateColumns: "310px 160px 150px 270px minmax(360px, 1fr)",
+          gridTemplateColumns: DASHBOARD_GRID_COLUMNS,
           overflow: "hidden",
         }}
       >
@@ -833,42 +1380,77 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
                 {filtered.length.toLocaleString()} / {packages.length.toLocaleString()}
               </span>
             </div>
-            <div style={{ position: "relative" }}>
-              <input
-                value={q}
-                onChange={(event) => setQ(event.target.value)}
-                placeholder="Search package name"
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(0, 1fr) 132px",
+                gap: 7,
+              }}
+            >
+              <div style={{ position: "relative", minWidth: 0 }}>
+                <input
+                  value={q}
+                  onChange={(event) => setQ(event.target.value)}
+                  placeholder="Search package"
+                  style={{
+                    width: "100%",
+                    height: 34,
+                    background: t.surface2,
+                    border: `1px solid ${t.border}`,
+                    borderRadius: 7,
+                    padding: "0 30px 0 10px",
+                    color: t.fg1,
+                    outline: "none",
+                    fontFamily: "Inter, sans-serif",
+                    fontSize: 13,
+                  }}
+                />
+                {q && (
+                  <button
+                    onClick={() => setQ("")}
+                    style={{
+                      position: "absolute",
+                      right: 4,
+                      top: 4,
+                      width: 26,
+                      height: 26,
+                      border: 0,
+                      background: "transparent",
+                      color: t.fg3,
+                      cursor: "pointer",
+                    }}
+                    aria-label="Clear package search"
+                  >
+                    <Glyph name="close" size={12} />
+                  </button>
+                )}
+              </div>
+              <select
+                value={statusFilter}
+                onChange={(event) =>
+                  setStatusFilter(event.target.value as PackageStatusFilter)
+                }
+                aria-label="Filter packages by status"
                 style={{
                   width: "100%",
                   height: 34,
+                  minWidth: 0,
                   background: t.surface2,
                   border: `1px solid ${t.border}`,
                   borderRadius: 7,
-                  padding: "0 30px 0 10px",
                   color: t.fg1,
                   outline: "none",
                   fontFamily: "Inter, sans-serif",
-                  fontSize: 13,
+                  fontSize: 12,
+                  padding: "0 8px",
                 }}
-              />
-              {q && (
-                <button
-                  onClick={() => setQ("")}
-                  style={{
-                    position: "absolute",
-                    right: 4,
-                    top: 4,
-                    width: 26,
-                    height: 26,
-                    border: 0,
-                    background: "transparent",
-                    color: t.fg3,
-                    cursor: "pointer",
-                  }}
-                >
-                  <Glyph name="close" size={12} />
-                </button>
-              )}
+              >
+                {PACKAGE_STATUS_FILTERS.map((filter) => (
+                  <option key={filter.value} value={filter.value}>
+                    {filter.label}
+                  </option>
+                ))}
+              </select>
             </div>
           </div>
 
@@ -967,7 +1549,13 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
               onSelect={setSelectedFilename}
               theme={theme}
             />
-            <ArtifactDetail pkg={selectedPackage} artifact={selectedArtifact} theme={theme} />
+            <ArtifactDetail
+              pkg={selectedPackage}
+              artifact={selectedArtifact}
+              selectedVersion={selectedVersion}
+              onSelectVersion={setSelectedVersion}
+              theme={theme}
+            />
           </>
         ) : (
           <div

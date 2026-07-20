@@ -133,6 +133,10 @@ export type AdvisoryVulnerability = {
   component_version?: string | null;
   modified?: string | null;
   source_advisory?: string | null;
+  severity?: string | null;
+  severity_score?: number | null;
+  severity_vector?: string | null;
+  severity_source?: string | null;
 };
 
 export type AdvisoryArtifactState = {
@@ -205,7 +209,7 @@ export type AdvisoryDashboardPayload = {
   sources: {
     s3_uri: string;
     mapping_json: string;
-    osv_summary: string;
+    osv_summary: string | null;
     channel_index_generated_at?: string | null;
     osv_summary_generated_at?: string | null;
   };

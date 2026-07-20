@@ -300,6 +300,15 @@ def load_osv_summary(path: Path) -> dict[str, Any]:
     return data
 
 
+def empty_osv_summary() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "packages": {},
+        "vulnerability_count": 0,
+        "package_count": 0,
+    }
+
+
 def _version_sort_key(version: str | None) -> tuple:
     if not version:
         return ()
@@ -378,6 +387,14 @@ def vulnerability_indexes(
                 "url": _url_for_vulnerability(vuln_id, vulnerability.get("url")),
                 "source_advisory": vulnerability.get("source_advisory"),
             }
+            for severity_key in (
+                "severity",
+                "severity_score",
+                "severity_vector",
+                "severity_source",
+            ):
+                if vulnerability.get(severity_key) is not None:
+                    item[severity_key] = vulnerability.get(severity_key)
             cleaned.append(item)
             source_advisory = item["source_advisory"]
             if isinstance(source_advisory, str):
@@ -401,6 +418,20 @@ def _placeholder_vulnerabilities(osv: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _indexed_vulnerabilities(osv: dict[str, Any]) -> list[dict[str, Any]]:
+    vulnerabilities: list[dict[str, Any]] = []
+    for vulnerability in _as_list(osv.get("vulnerabilities")):
+        if not isinstance(vulnerability, dict):
+            continue
+        vuln_id = vulnerability.get("id")
+        item = {
+            **vulnerability,
+            "url": _url_for_vulnerability(vuln_id, vulnerability.get("url")),
+        }
+        vulnerabilities.append(item)
+    return vulnerabilities
+
+
 def artifact_from_record(
     *,
     filename: str,
@@ -414,6 +445,8 @@ def artifact_from_record(
     vulnerabilities = (
         vulnerabilities_by_advisory.get(osv_current, []) if osv_current else []
     )
+    if not vulnerabilities:
+        vulnerabilities = _indexed_vulnerabilities(osv)
     if not vulnerabilities and int(osv.get("vulnerability_count") or 0) > 0:
         vulnerabilities = _placeholder_vulnerabilities(osv)
     vulnerability_count = int(osv.get("vulnerability_count") or len(vulnerabilities))
@@ -656,7 +689,7 @@ def dashboard_payload(
     *,
     s3_uri: str,
     mapping_json: Path,
-    osv_summary_path: Path,
+    osv_summary_path: Path | None,
     channel_index: dict[str, Any],
     subdir_indexes: list[dict[str, Any]],
     mappings: dict[str, dict[str, Any]],
@@ -693,7 +726,7 @@ def dashboard_payload(
         "sources": {
             "s3_uri": s3_uri,
             "mapping_json": str(mapping_json),
-            "osv_summary": str(osv_summary_path),
+            "osv_summary": str(osv_summary_path) if osv_summary_path else None,
             "channel_index_generated_at": channel_index.get("generated_at"),
             "osv_summary_generated_at": osv_summary.get("generated_at"),
         },
@@ -758,6 +791,7 @@ def build_dashboard_data(
     s3_uri: str,
     mapping_json: Path,
     osv_summary_path: Path,
+    skip_osv_summary: bool = False,
     workers: int = DEFAULT_WORKERS,
     profile: str | None = None,
     region: str | None = None,
@@ -771,11 +805,13 @@ def build_dashboard_data(
         runner=runner,
     )
     mappings = load_mapping_by_name(mapping_json)
-    osv_summary = load_osv_summary(osv_summary_path)
+    osv_summary = empty_osv_summary() if skip_osv_summary else load_osv_summary(
+        osv_summary_path
+    )
     return dashboard_payload(
         s3_uri=s3_uri,
         mapping_json=mapping_json,
-        osv_summary_path=osv_summary_path,
+        osv_summary_path=None if skip_osv_summary else osv_summary_path,
         channel_index=channel_index,
         subdir_indexes=subdir_indexes,
         mappings=mappings,
@@ -796,6 +832,14 @@ def main() -> None:
         type=Path,
         default=DEFAULT_OSV_SUMMARY,
         help="local OSV vulnerability summary JSON",
+    )
+    parser.add_argument(
+        "--skip-osv-summary",
+        action="store_true",
+        help=(
+            "build from advisory indexes/shards only; this skips the OSV "
+            "vulnerability-summary file and avoids the per-OSV-artifact summary scan"
+        ),
     )
     parser.add_argument(
         "--out",
@@ -830,10 +874,11 @@ def main() -> None:
             raise DashboardDataError("--s3-uri is required")
         LOGGER.info(
             "starting dashboard data build s3_uri=%s mapping_json=%s "
-            "osv_summary=%s out=%s workers=%d s3_output_uri=%s",
+            "osv_summary=%s skip_osv_summary=%s out=%s workers=%d s3_output_uri=%s",
             args.s3_uri,
             args.mapping_json,
             args.osv_summary,
+            args.skip_osv_summary,
             args.out,
             args.workers,
             args.s3_output_uri,
@@ -842,6 +887,7 @@ def main() -> None:
             s3_uri=args.s3_uri,
             mapping_json=args.mapping_json,
             osv_summary_path=args.osv_summary,
+            skip_osv_summary=args.skip_osv_summary,
             workers=args.workers,
             profile=args.s3_profile,
             region=args.s3_region,
