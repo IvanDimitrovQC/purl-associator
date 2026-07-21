@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import logging
@@ -33,6 +34,7 @@ from scripts.s3_publish import (
 
 DEFAULT_OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 DEFAULT_OSV_BATCH_SIZE = 250
+DEFAULT_OSV_DETAIL_WORKERS = 8
 DEFAULT_OSV_RETRIES = 3
 DEFAULT_OSV_RETRY_DELAY_SECONDS = 1.0
 OSV_ADVISORY_SCHEMA_VERSION = 2
@@ -187,10 +189,185 @@ def _post_json(
     return data
 
 
+def _get_json(
+    url: str,
+    *,
+    retries: int = DEFAULT_OSV_RETRIES,
+    retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
+) -> dict[str, Any]:
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "purl-associator-osv-correlator",
+        },
+        method="GET",
+    )
+    for attempt in range(retries + 1):
+        try:
+            LOGGER.info("getting OSV detail url=%s attempt=%d", url, attempt + 1)
+            with urlopen(request, timeout=60) as response:
+                data = json.load(response)
+            break
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            retryable = exc.code == 429 or 500 <= exc.code <= 599
+            if retryable and attempt < retries:
+                fallback = retry_delay_seconds * (2**attempt)
+                delay = _retry_after_seconds(exc, fallback)
+                LOGGER.warning(
+                    "OSV detail retry http_status=%s attempt=%d delay_seconds=%.2f",
+                    exc.code,
+                    attempt + 1,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            LOGGER.error(
+                "OSV detail request failed http_status=%s error=%s",
+                exc.code,
+                detail,
+            )
+            raise OsvError(
+                f"OSV detail request failed with HTTP {exc.code}: {detail}"
+            ) from exc
+        except URLError as exc:
+            if attempt < retries:
+                delay = retry_delay_seconds * (2**attempt)
+                LOGGER.warning(
+                    "OSV detail retry error=%s attempt=%d delay_seconds=%.2f",
+                    exc.reason,
+                    attempt + 1,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            LOGGER.error("OSV detail request failed error=%s", exc.reason)
+            raise OsvError(f"OSV detail request failed: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise OsvError(f"OSV detail returned invalid JSON: {exc}") from exc
+    else:
+        raise OsvError("OSV detail request failed after retries")
+    if not isinstance(data, dict):
+        raise OsvError("OSV detail returned a non-object JSON payload")
+    return data
+
+
+def _vuln_detail_url(*, api_url: str, vulnerability_id: str) -> str:
+    return f"{api_url.rsplit('/', 1)[0]}/vulns/{quote(vulnerability_id, safe='')}"
+
+
+def _vulnerability_ids(
+    osv_results: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    ids: list[str] = []
+    for vulnerabilities in osv_results.values():
+        for vulnerability in vulnerabilities:
+            vuln_id = vulnerability.get("id")
+            if isinstance(vuln_id, str) and vuln_id:
+                ids.append(vuln_id)
+    return list(dict.fromkeys(ids))
+
+
+def query_osv_vulnerability(
+    vulnerability_id: str,
+    *,
+    api_url: str = DEFAULT_OSV_BATCH_URL,
+    retries: int = DEFAULT_OSV_RETRIES,
+    retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
+) -> dict[str, Any]:
+    detail = _get_json(
+        _vuln_detail_url(api_url=api_url, vulnerability_id=vulnerability_id),
+        retries=retries,
+        retry_delay_seconds=retry_delay_seconds,
+    )
+    compact = {
+        key: detail[key]
+        for key in ("id", "modified", "severity", "database_specific")
+        if key in detail
+    }
+    if not isinstance(compact.get("id"), str):
+        compact["id"] = vulnerability_id
+    return compact
+
+
+def query_osv_vulnerabilities(
+    vulnerability_ids: list[str],
+    *,
+    api_url: str = DEFAULT_OSV_BATCH_URL,
+    workers: int = DEFAULT_OSV_DETAIL_WORKERS,
+    retries: int = DEFAULT_OSV_RETRIES,
+    retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
+) -> dict[str, dict[str, Any]]:
+    unique_ids = list(dict.fromkeys(vulnerability_ids))
+    if not unique_ids:
+        return {}
+    if workers < 1:
+        raise OsvError("--workers must be at least 1")
+    LOGGER.info("hydrating OSV vulnerability details count=%d", len(unique_ids))
+    if workers == 1 or len(unique_ids) <= 1:
+        return {
+            vulnerability_id: query_osv_vulnerability(
+                vulnerability_id,
+                api_url=api_url,
+                retries=retries,
+                retry_delay_seconds=retry_delay_seconds,
+            )
+            for vulnerability_id in unique_ids
+        }
+
+    details: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                query_osv_vulnerability,
+                vulnerability_id,
+                api_url=api_url,
+                retries=retries,
+                retry_delay_seconds=retry_delay_seconds,
+            ): vulnerability_id
+            for vulnerability_id in unique_ids
+        }
+        for future in as_completed(futures):
+            vulnerability_id = futures[future]
+            details[vulnerability_id] = future.result()
+    return details
+
+
+def hydrate_osv_details(
+    osv_results: dict[str, list[dict[str, Any]]],
+    *,
+    api_url: str = DEFAULT_OSV_BATCH_URL,
+    workers: int = DEFAULT_OSV_DETAIL_WORKERS,
+    retries: int = DEFAULT_OSV_RETRIES,
+    retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
+) -> dict[str, list[dict[str, Any]]]:
+    details = query_osv_vulnerabilities(
+        _vulnerability_ids(osv_results),
+        api_url=api_url,
+        workers=workers,
+        retries=retries,
+        retry_delay_seconds=retry_delay_seconds,
+    )
+    if not details:
+        return osv_results
+    hydrated: dict[str, list[dict[str, Any]]] = {}
+    for purl, vulnerabilities in osv_results.items():
+        hydrated[purl] = [
+            {**vulnerability, **details.get(str(vulnerability.get("id")), {})}
+            if isinstance(vulnerability.get("id"), str)
+            else vulnerability
+            for vulnerability in vulnerabilities
+        ]
+    return hydrated
+
+
 def query_osv_batch(
     purls: list[str],
     *,
     api_url: str = DEFAULT_OSV_BATCH_URL,
+    hydrate_details: bool = True,
+    detail_workers: int = DEFAULT_OSV_DETAIL_WORKERS,
     retries: int = DEFAULT_OSV_RETRIES,
     retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -254,7 +431,15 @@ def query_osv_batch(
         )
         pending = next_pending
 
-    return results
+    if not hydrate_details:
+        return results
+    return hydrate_osv_details(
+        results,
+        api_url=api_url,
+        workers=detail_workers,
+        retries=retries,
+        retry_delay_seconds=retry_delay_seconds,
+    )
 
 
 def query_osv_chunked(
@@ -262,6 +447,8 @@ def query_osv_chunked(
     *,
     api_url: str = DEFAULT_OSV_BATCH_URL,
     batch_size: int = DEFAULT_OSV_BATCH_SIZE,
+    hydrate_details: bool = True,
+    detail_workers: int = DEFAULT_OSV_DETAIL_WORKERS,
     delay_seconds: float = 0.0,
     retries: int = DEFAULT_OSV_RETRIES,
     retry_delay_seconds: float = DEFAULT_OSV_RETRY_DELAY_SECONDS,
@@ -291,6 +478,7 @@ def query_osv_chunked(
             query_osv_batch(
                 chunk,
                 api_url=api_url,
+                hydrate_details=False,
                 retries=retries,
                 retry_delay_seconds=retry_delay_seconds,
             )
@@ -301,7 +489,15 @@ def query_osv_chunked(
             index + len(chunk),
             len(unique_purls),
         )
-    return results
+    if not hydrate_details:
+        return results
+    return hydrate_osv_details(
+        results,
+        api_url=api_url,
+        workers=detail_workers,
+        retries=retries,
+        retry_delay_seconds=retry_delay_seconds,
+    )
 
 
 def _subject(sbom: dict[str, Any]) -> dict[str, Any] | None:

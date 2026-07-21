@@ -39,6 +39,25 @@ const PACKAGE_STATUS_FILTERS: Array<{
 const DASHBOARD_GRID_COLUMNS = "310px 160px 150px 270px minmax(360px, 1fr)";
 const DRILLDOWN_ROW_HEIGHT = 46;
 
+type VersionFindingRow = {
+  version: string;
+  artifactCount: number;
+  checkedCount: number;
+  vulnerabilityCount: number;
+};
+
+type VulnerabilitySort = "severity" | "newest" | "oldest" | "id";
+
+const VULNERABILITY_SORT_OPTIONS: Array<{
+  value: VulnerabilitySort;
+  label: string;
+}> = [
+  { value: "severity", label: "Severity" },
+  { value: "newest", label: "Newest" },
+  { value: "oldest", label: "Oldest" },
+  { value: "id", label: "ID" },
+];
+
 function uniqueSorted(values: Array<string | null | undefined>): string[] {
   return Array.from(new Set(values.filter((value): value is string => Boolean(value))))
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
@@ -50,6 +69,28 @@ function versionKey(version: string | null): string {
 
 function artifactVulnerabilityCount(artifact: DashboardArtifact): number {
   return artifact.osv.vulnerability_count ?? artifact.vulnerabilities.length;
+}
+
+function artifactVulnerabilityKeys(artifact: DashboardArtifact): string[] {
+  const keys = artifact.vulnerabilities
+    .map((vulnerability, index) => {
+      if (vulnerability.id) return vulnerability.id;
+      if (vulnerability.url) return vulnerability.url;
+      if (vulnerability.component_purl) {
+        return `${vulnerability.component_purl}#${index}`;
+      }
+      return null;
+    })
+    .filter((value): value is string => Boolean(value));
+  if (keys.length > 0) return Array.from(new Set(keys));
+
+  const findingIds = artifact.osv.finding_ids?.filter(Boolean) ?? [];
+  if (findingIds.length > 0) return Array.from(new Set(findingIds));
+
+  return Array.from(
+    { length: artifactVulnerabilityCount(artifact) },
+    (_, index) => `${artifact.filename}#${index}`,
+  );
 }
 
 function latestVersion(pkg: DashboardPackage): string | null {
@@ -158,6 +199,96 @@ function severityTitle(vuln: AdvisoryVulnerability): string {
     pieces.push(vuln.severity_vector);
   }
   return pieces.join(" · ");
+}
+
+function severityRank(severity: string | null | undefined): number {
+  const normalized = severity?.toUpperCase();
+  if (normalized === "CRITICAL") return 5;
+  if (normalized === "HIGH") return 4;
+  if (normalized === "MEDIUM") return 3;
+  if (normalized === "LOW") return 2;
+  if (normalized === "NONE") return 1;
+  return 0;
+}
+
+function vulnerabilityTimestamp(vuln: AdvisoryVulnerability): number | null {
+  if (!vuln.modified) return null;
+  const timestamp = Date.parse(vuln.modified);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function vulnerabilitySortLabel(sort: VulnerabilitySort): string {
+  return (
+    VULNERABILITY_SORT_OPTIONS.find((option) => option.value === sort)?.label ?? sort
+  );
+}
+
+function vulnerabilityId(vuln: AdvisoryVulnerability): string {
+  return vuln.id ?? vuln.url ?? vuln.component_purl ?? "";
+}
+
+function compareVulnerabilitiesById(
+  a: AdvisoryVulnerability,
+  b: AdvisoryVulnerability,
+): number {
+  return vulnerabilityId(a).localeCompare(vulnerabilityId(b), undefined, {
+    numeric: true,
+  });
+}
+
+function compareNullableTimestamp(
+  a: number | null,
+  b: number | null,
+  direction: "asc" | "desc",
+): number {
+  if (a === null && b === null) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  return direction === "asc" ? a - b : b - a;
+}
+
+function sortVulnerabilities(
+  vulnerabilities: AdvisoryVulnerability[],
+  sort: VulnerabilitySort,
+): AdvisoryVulnerability[] {
+  return vulnerabilities.slice().sort((a, b) => {
+    if (sort === "severity") {
+      const severityDelta = severityRank(b.severity) - severityRank(a.severity);
+      if (severityDelta !== 0) return severityDelta;
+      const scoreDelta = (b.severity_score ?? -1) - (a.severity_score ?? -1);
+      if (scoreDelta !== 0) return scoreDelta;
+      const timeDelta = compareNullableTimestamp(
+        vulnerabilityTimestamp(a),
+        vulnerabilityTimestamp(b),
+        "desc",
+      );
+      if (timeDelta !== 0) return timeDelta;
+      return compareVulnerabilitiesById(a, b);
+    }
+    if (sort === "newest") {
+      const timeDelta = compareNullableTimestamp(
+        vulnerabilityTimestamp(a),
+        vulnerabilityTimestamp(b),
+        "desc",
+      );
+      if (timeDelta !== 0) return timeDelta;
+      const severityDelta = severityRank(b.severity) - severityRank(a.severity);
+      if (severityDelta !== 0) return severityDelta;
+      return compareVulnerabilitiesById(a, b);
+    }
+    if (sort === "oldest") {
+      const timeDelta = compareNullableTimestamp(
+        vulnerabilityTimestamp(a),
+        vulnerabilityTimestamp(b),
+        "asc",
+      );
+      if (timeDelta !== 0) return timeDelta;
+      const severityDelta = severityRank(b.severity) - severityRank(a.severity);
+      if (severityDelta !== 0) return severityDelta;
+      return compareVulnerabilitiesById(a, b);
+    }
+    return compareVulnerabilitiesById(a, b);
+  });
 }
 
 function matchesStatusFilter(
@@ -314,6 +445,8 @@ function SelectorColumn({
   onSelect,
   theme,
   width,
+  renderSuffix,
+  getItemTitle,
 }: {
   title: string;
   items: string[];
@@ -321,6 +454,8 @@ function SelectorColumn({
   onSelect: (item: string) => void;
   theme: Theme;
   width: number;
+  renderSuffix?: (item: string) => ReactNode;
+  getItemTitle?: (item: string) => string;
 }) {
   return (
     <section
@@ -352,6 +487,7 @@ function SelectorColumn({
         ) : (
           items.map((item) => {
             const active = item === selected;
+            const suffix = renderSuffix?.(item);
             return (
               <button
                 key={item}
@@ -373,7 +509,7 @@ function SelectorColumn({
                   fontSize: 12,
                   textAlign: "left",
                 }}
-                title={item}
+                title={getItemTitle?.(item) ?? item}
               >
                 <span
                   style={{
@@ -384,7 +520,17 @@ function SelectorColumn({
                 >
                   {item}
                 </span>
-                {active && <Glyph name="chev" size={12} />}
+                <span
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    flexShrink: 0,
+                  }}
+                >
+                  {suffix}
+                  {active && <Glyph name="chev" size={12} />}
+                </span>
               </button>
             );
           })
@@ -568,6 +714,12 @@ function VulnerabilityList({
   vulnerabilities: AdvisoryVulnerability[];
   theme: Theme;
 }) {
+  const [sort, setSort] = useState<VulnerabilitySort>("severity");
+  const sortedVulnerabilities = useMemo(
+    () => sortVulnerabilities(vulnerabilities, sort),
+    [vulnerabilities, sort],
+  );
+
   if (vulnerabilities.length === 0) {
     return (
       <div style={{ color: theme.t.fg3, fontSize: 12 }}>
@@ -577,7 +729,62 @@ function VulnerabilityList({
   }
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {vulnerabilities.map((vuln, index) => (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 10,
+        }}
+      >
+        <span
+          style={{
+            color: theme.t.fg3,
+            fontSize: 10.5,
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          {vulnerabilities.length.toLocaleString()} CVEs
+        </span>
+        <label
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            color: theme.t.fg2,
+            fontSize: 11,
+          }}
+          title={`Sorted by ${vulnerabilitySortLabel(sort).toLowerCase()}`}
+        >
+          Sort
+          <select
+            value={sort}
+            onChange={(event) =>
+              setSort(event.target.value as VulnerabilitySort)
+            }
+            aria-label="Sort vulnerabilities"
+            style={{
+              height: 28,
+              minWidth: 108,
+              background: theme.t.surface2,
+              border: `1px solid ${theme.t.border}`,
+              borderRadius: 6,
+              color: theme.t.fg1,
+              outline: "none",
+              fontFamily: "Inter, sans-serif",
+              fontSize: 11,
+              padding: "0 7px",
+            }}
+          >
+            {VULNERABILITY_SORT_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {sortedVulnerabilities.map((vuln, index) => (
         <div
           key={`${vuln.id}-${vuln.component_purl}-${index}`}
           style={{
@@ -656,26 +863,24 @@ function VulnerabilityList({
   );
 }
 
-function versionFindingRows(pkg: DashboardPackage): Array<{
-  version: string;
-  artifactCount: number;
-  checkedCount: number;
-  findingCount: number;
-}> {
+function versionFindingRows(pkg: DashboardPackage): VersionFindingRow[] {
   return uniqueSorted(pkg.artifacts.map((artifact) => artifact.version))
     .reverse()
     .map((version) => {
       const artifacts = pkg.artifacts.filter(
         (artifact) => versionKey(artifact.version) === version,
       );
+      const vulnerabilityKeys = new Set<string>();
+      for (const artifact of artifacts) {
+        for (const key of artifactVulnerabilityKeys(artifact)) {
+          vulnerabilityKeys.add(key);
+        }
+      }
       return {
         version,
         artifactCount: artifacts.length,
         checkedCount: artifacts.filter((artifact) => artifact.osv.exists).length,
-        findingCount: artifacts.reduce(
-          (total, artifact) => total + artifactVulnerabilityCount(artifact),
-          0,
-        ),
+        vulnerabilityCount: vulnerabilityKeys.size,
       };
     });
 }
@@ -697,20 +902,23 @@ function VersionFindingsChart({
 }) {
   const rows = versionFindingRows(pkg).slice().reverse();
   if (rows.length === 0) return null;
-  const maxFindings = Math.max(1, ...rows.map((row) => row.findingCount));
+  const maxVulnerabilities = Math.max(
+    1,
+    ...rows.map((row) => row.vulnerabilityCount),
+  );
   const chartWidth = Math.max(420, rows.length * 58 + 64);
   const chartHeight = 176;
   const margin = { top: 18, right: 18, bottom: 42, left: 34 };
   const plotWidth = chartWidth - margin.left - margin.right;
   const plotHeight = chartHeight - margin.top - margin.bottom;
   const yTicks = Array.from(
-    new Set([0, Math.ceil(maxFindings / 2), maxFindings]),
+    new Set([0, Math.ceil(maxVulnerabilities / 2), maxVulnerabilities]),
   );
   const xForIndex = (index: number) =>
     margin.left +
     (rows.length === 1 ? plotWidth / 2 : (index / (rows.length - 1)) * plotWidth);
   const yForCount = (count: number) =>
-    margin.top + plotHeight - (count / maxFindings) * plotHeight;
+    margin.top + plotHeight - (count / maxVulnerabilities) * plotHeight;
   const checkedSegments: string[][] = [];
   let currentSegment: string[] = [];
   rows.forEach((row, index) => {
@@ -719,7 +927,7 @@ function VersionFindingsChart({
       currentSegment = [];
       return;
     }
-    currentSegment.push(`${xForIndex(index)},${yForCount(row.findingCount)}`);
+    currentSegment.push(`${xForIndex(index)},${yForCount(row.vulnerabilityCount)}`);
   });
   if (currentSegment.length > 0) checkedSegments.push(currentSegment);
   return (
@@ -748,7 +956,7 @@ function VersionFindingsChart({
             textTransform: "uppercase",
           }}
         >
-          Findings by version
+          Vulnerabilities by version
         </div>
         <div
           style={{
@@ -822,9 +1030,9 @@ function VersionFindingsChart({
           {rows.map((row, index) => {
             const x = xForIndex(index);
             const checked = row.checkedCount > 0;
-            const y = checked ? yForCount(row.findingCount) : yForCount(0);
+            const y = checked ? yForCount(row.vulnerabilityCount) : yForCount(0);
             const active = versionKey(selectedVersion) === row.version;
-            const vulnerable = row.findingCount > 0;
+            const vulnerable = row.vulnerabilityCount > 0;
             const pointColor = !checked
               ? theme.t.warn
               : vulnerable
@@ -852,8 +1060,10 @@ function VersionFindingsChart({
               >
                 <title>
                   {`${row.version}: ${
-                    checked ? row.findingCount : "missing OSV"
-                  } finding(s) across ${row.artifactCount} artifact(s)`}
+                    checked ? row.vulnerabilityCount : "missing OSV"
+                  } unique vulnerability ID(s) across ${
+                    row.artifactCount
+                  } artifact(s)`}
                 </title>
                 <line
                   x1={x}
@@ -891,7 +1101,7 @@ function VersionFindingsChart({
                     fontWeight={700}
                     fontFamily="JetBrains Mono, monospace"
                   >
-                    {row.findingCount}
+                    {row.vulnerabilityCount}
                   </text>
                 )}
                 {showVersionLabel && (
@@ -935,7 +1145,7 @@ function VersionFindingsChart({
             Latest: {rows[rows.length - 1]?.version ?? "—"}
           </span>
           <span>
-            Max findings: {maxFindings}
+            Max vulns: {maxVulnerabilities}
           </span>
           <span>
             Checked: {rows.filter((row) => row.checkedCount > 0).length}/
@@ -1166,12 +1376,19 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
     [packages, selectedPackageName],
   );
 
-  const versions = useMemo(
-    () =>
-      uniqueSorted(
-        selectedPackage?.artifacts.map((artifact) => artifact.version) ?? [],
-      ).reverse(),
+  const versionRows = useMemo(
+    () => (selectedPackage ? versionFindingRows(selectedPackage) : []),
     [selectedPackage],
+  );
+
+  const versionRowsByVersion = useMemo(
+    () => new Map(versionRows.map((row) => [row.version, row])),
+    [versionRows],
+  );
+
+  const versions = useMemo(
+    () => versionRows.map((row) => row.version),
+    [versionRows],
   );
 
   useEffect(() => {
@@ -1534,6 +1751,33 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
               onSelect={setSelectedVersion}
               theme={theme}
               width={160}
+              renderSuffix={(version) => {
+                const row = versionRowsByVersion.get(version);
+                if (!row) return null;
+                return (
+                  <Badge
+                    theme={theme}
+                    tone={
+                      row.vulnerabilityCount > 0
+                        ? "bad"
+                        : row.checkedCount > 0
+                          ? "good"
+                          : "warn"
+                    }
+                  >
+                    {row.vulnerabilityCount}
+                  </Badge>
+                );
+              }}
+              getItemTitle={(version) => {
+                const row = versionRowsByVersion.get(version);
+                if (!row) return version;
+                const checkedSuffix =
+                  row.checkedCount === row.artifactCount
+                    ? ""
+                    : `; OSV checked for ${row.checkedCount}/${row.artifactCount}`;
+                return `${version}: ${row.vulnerabilityCount} unique vulnerability ID(s) across ${row.artifactCount} artifact(s)${checkedSuffix}`;
+              }}
             />
             <SelectorColumn
               title="Platforms"

@@ -11,6 +11,7 @@ from scripts.correlate_osv import (
     default_output_path,
     extract_component_purls,
     finalized_advisory,
+    query_osv_chunked,
     versioned_output_path,
     write_advisory,
 )
@@ -92,6 +93,71 @@ class CorrelateOsvTests(unittest.TestCase):
         self.assertEqual(
             advisory["skipped_components"][0]["reason"],
             "component PURL is not versioned",
+        )
+
+    def test_query_osv_chunked_hydrates_unique_vulnerability_details(self) -> None:
+        query_responses = [
+            {
+                "results": [
+                    {
+                        "vulns": [
+                            {
+                                "id": "GHSA-demo-0001",
+                                "modified": "2026-01-01T00:00:00Z",
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "results": [
+                    {
+                        "vulns": [
+                            {
+                                "id": "GHSA-demo-0001",
+                                "modified": "2026-01-01T00:00:00Z",
+                            }
+                        ]
+                    }
+                ]
+            },
+        ]
+        details = {
+            "GHSA-demo-0001": {
+                "id": "GHSA-demo-0001",
+                "modified": "2026-01-02T00:00:00Z",
+                "database_specific": {"severity": "HIGH"},
+                "severity": [
+                    {
+                        "type": "CVSS_V3",
+                        "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                    }
+                ],
+            }
+        }
+
+        with (
+            patch("scripts.correlate_osv._post_json", side_effect=query_responses),
+            patch(
+                "scripts.correlate_osv.query_osv_vulnerabilities",
+                return_value=details,
+            ) as detail_mock,
+        ):
+            results = query_osv_chunked(
+                ["pkg:pypi/a@1", "pkg:pypi/b@1"],
+                batch_size=1,
+                detail_workers=4,
+            )
+
+        detail_mock.assert_called_once()
+        self.assertEqual(detail_mock.call_args.args[0], ["GHSA-demo-0001"])
+        self.assertEqual(
+            results["pkg:pypi/a@1"][0]["severity"][0]["type"],
+            "CVSS_V3",
+        )
+        self.assertEqual(
+            results["pkg:pypi/a@1"][0]["modified"],
+            "2026-01-02T00:00:00Z",
         )
 
     def test_default_output_path_uses_advisories_sibling(self) -> None:

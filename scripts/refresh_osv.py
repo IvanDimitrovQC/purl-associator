@@ -231,7 +231,12 @@ def refresh_osv(
             current={"stage": "query_osv", "unique_purls": len(purls)},
         )
     osv_results = (
-        query_osv_chunked(purls, api_url=api_url, batch_size=batch_size)
+        query_osv_chunked(
+            purls,
+            api_url=api_url,
+            batch_size=batch_size,
+            detail_workers=workers,
+        )
         if purls
         else {}
     )
