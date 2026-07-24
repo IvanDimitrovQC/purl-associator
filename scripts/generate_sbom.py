@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import logging
 import sys
 import uuid
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,10 @@ DEFAULT_MAPPING_PAYLOAD = ROOT / "mappings" / "auto.json"
 DEFAULT_LOCAL_CHANNEL = ROOT / "local-advisory-channel"
 DEFAULT_CHANNEL = "conda-forge"
 SBOM_INPUT_SCHEMA_VERSION = 1
+SECURITY_ARTIFACT_KIND_SBOM = "SBOM"
+SECURITY_SBOM_SCHEMA = "v1"
+SECURITY_SBOM_PAYLOAD_NAME = f"sbom.{SECURITY_SBOM_SCHEMA}.json"
+SECURITY_METADATA_NAME = "info/security.json"
 SBOM_RELEVANT_MAPPING_FIELDS = (
     "name",
     "version",
@@ -93,6 +99,16 @@ def _canonical_json(data: Any) -> str:
 
 def _sha256(data: Any) -> str:
     return hashlib.sha256(_canonical_json(data).encode()).hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _pretty_json_bytes(data: Any) -> bytes:
+    return (
+        json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode()
 
 
 def sbom_relevant_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
@@ -319,6 +335,14 @@ def add_version_to_purl(purl: str, version: str) -> str:
     return f"{base}{qualifiers}{subpath}"
 
 
+def conda_artifact_stem(filename: str) -> str:
+    if filename.endswith(".tar.bz2"):
+        return filename.removesuffix(".tar.bz2")
+    if filename.endswith(".conda"):
+        return filename.removesuffix(".conda")
+    return Path(filename).stem
+
+
 def validate_mapping_purl_type(
     mapping: dict[str, Any], *, package: str, purl_type_filter: str
 ) -> None:
@@ -472,13 +496,147 @@ def build_cyclonedx_sbom(
 
 
 def default_output_path(root: Path, *, subdir: str, filename: str) -> Path:
-    return root / subdir / "sboms" / filename
+    return root / subdir / f"{conda_artifact_stem(filename)}.sboms"
 
 
 def sbom_output_path(root: Path, *, subdir: str, filename: str, version: str) -> Path:
     return default_output_path(root, subdir=subdir, filename=filename) / (
-        f"sbom-{version}.cdx.json"
+        f"{version}.conda"
     )
+
+
+def _metadata_timestamp(sbom: dict[str, Any]) -> str | None:
+    metadata = sbom.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    timestamp = metadata.get("timestamp")
+    return timestamp if isinstance(timestamp, str) else None
+
+
+def _created_on_from_sbom(sbom: dict[str, Any]) -> int:
+    timestamp = _metadata_timestamp(sbom)
+    if timestamp:
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return int(parsed.timestamp())
+        except ValueError:
+            pass
+    return int(datetime.now(UTC).timestamp())
+
+
+def _zip_info(name: str, *, created_on: int) -> zipfile.ZipInfo:
+    timestamp = max(created_on, 315532800)
+    date_time = datetime.fromtimestamp(timestamp, UTC).timetuple()[:6]
+    info = zipfile.ZipInfo(name, date_time)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    return info
+
+
+def build_security_sbom_metadata(
+    *,
+    sbom_payload: bytes,
+    created_on: int,
+    parent_sha256: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "kind": SECURITY_ARTIFACT_KIND_SBOM,
+            "data_schema": f"sbom.{SECURITY_SBOM_SCHEMA}",
+            "parent_sha256": parent_sha256,
+            "created_on": created_on,
+        },
+        "artifacts": {
+            SECURITY_SBOM_PAYLOAD_NAME: {
+                "sha256": _sha256_bytes(sbom_payload),
+                "size": len(sbom_payload),
+            },
+        },
+    }
+
+
+def build_security_sbom_artifact_bytes(
+    *,
+    sbom: dict[str, Any],
+    parent_sha256: str | None = None,
+) -> bytes:
+    created_on = _created_on_from_sbom(sbom)
+    sbom_payload = _pretty_json_bytes(sbom)
+    security = build_security_sbom_metadata(
+        sbom_payload=sbom_payload,
+        created_on=created_on,
+        parent_sha256=parent_sha256,
+    )
+    security_payload = _pretty_json_bytes(security)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w") as archive:
+        archive.writestr(
+            _zip_info(SECURITY_METADATA_NAME, created_on=created_on),
+            security_payload,
+        )
+        archive.writestr(
+            _zip_info(SECURITY_SBOM_PAYLOAD_NAME, created_on=created_on),
+            sbom_payload,
+        )
+    return buffer.getvalue()
+
+
+def get_security_sbom_artifact_sha256(sbom: dict[str, Any]) -> str:
+    return _sha256_bytes(build_security_sbom_artifact_bytes(sbom=sbom))
+
+
+def _is_security_artifact_name(path: Path) -> bool:
+    stem = path.name.removesuffix(".conda")
+    return (
+        path.name.endswith(".conda")
+        and len(stem) == 64
+        and all(char in "0123456789abcdef" for char in stem)
+    )
+
+
+def read_security_sbom_payload(path: Path) -> dict[str, Any]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            with archive.open(SECURITY_SBOM_PAYLOAD_NAME) as payload_file:
+                payload = json.load(payload_file)
+    except (
+        FileNotFoundError,
+        KeyError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+    ) as exc:
+        raise SbomError(f"{path}: invalid SBOM security artifact: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SbomError(f"{path}: SBOM payload must be a JSON object")
+    return payload
+
+
+def find_existing_security_sbom_artifact(
+    *,
+    root: Path,
+    subdir: str,
+    filename: str,
+    sbom_version_id: str,
+) -> Path | None:
+    artifact_dir = default_output_path(root, subdir=subdir, filename=filename)
+    if not artifact_dir.exists():
+        return None
+    for candidate in sorted(artifact_dir.glob("*.conda")):
+        if not _is_security_artifact_name(candidate):
+            continue
+        try:
+            existing_sbom = read_security_sbom_payload(candidate)
+            existing_version = get_sbom_version(existing_sbom)
+        except SbomError:
+            LOGGER.warning(
+                "ignoring unreadable SBOM security artifact path=%s", candidate
+            )
+            continue
+        if existing_version == sbom_version_id:
+            return candidate
+    return None
 
 
 def expected_sbom_artifact_paths(
@@ -490,15 +648,21 @@ def expected_sbom_artifact_paths(
     filename: str,
     channel: str,
 ) -> list[Path]:
-    version, _inputs_hash, _mapping_hash = sbom_version(
+    sbom = build_cyclonedx_sbom(
         mapping=mapping,
         record=record,
         filename=filename,
         channel=channel,
         subdir=subdir,
     )
+    artifact_sha256 = get_security_sbom_artifact_sha256(sbom)
     return [
-        sbom_output_path(root, subdir=subdir, filename=filename, version=version),
+        sbom_output_path(
+            root,
+            subdir=subdir,
+            filename=filename,
+            version=artifact_sha256,
+        ),
     ]
 
 
@@ -531,13 +695,37 @@ def write_versioned_sbom(
     filename: str,
 ) -> tuple[Path, bool]:
     version = get_sbom_version(sbom)
-    out = sbom_output_path(root, subdir=subdir, filename=filename, version=version)
+    existing = find_existing_security_sbom_artifact(
+        root=root,
+        subdir=subdir,
+        filename=filename,
+        sbom_version_id=version,
+    )
+    if existing is not None:
+        LOGGER.info(
+            "SBOM security artifact already exists path=%s sbom_version=%s",
+            existing,
+            version,
+        )
+        return existing, False
+    artifact_bytes = build_security_sbom_artifact_bytes(sbom=sbom)
+    artifact_sha256 = _sha256_bytes(artifact_bytes)
+    out = sbom_output_path(
+        root, subdir=subdir, filename=filename, version=artifact_sha256
+    )
     if out.exists():
-        LOGGER.info("SBOM version already exists path=%s", out)
+        LOGGER.info("SBOM security artifact already exists path=%s", out)
         return out, False
-    LOGGER.info("writing SBOM artifact path=%s version=%s", out, version)
+    LOGGER.info(
+        "writing SBOM security artifact path=%s sbom_version=%s artifact_sha256=%s",
+        out,
+        version,
+        artifact_sha256,
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(sbom, indent=2) + "\n")
+    tmp = out.with_name(f".{out.name}.tmp")
+    tmp.write_bytes(artifact_bytes)
+    tmp.replace(out)
     return out, True
 
 
@@ -789,9 +977,9 @@ def main() -> None:
         if args.out:
             out = args.out
             out.parent.mkdir(parents=True, exist_ok=True)
-            LOGGER.info("writing explicit SBOM path=%s", out)
-            out.write_text(json.dumps(sbom, indent=2) + "\n")
-            status = "wrote explicit SBOM"
+            LOGGER.info("writing explicit SBOM security artifact path=%s", out)
+            out.write_bytes(build_security_sbom_artifact_bytes(sbom=sbom))
+            status = "wrote explicit SBOM security artifact"
         else:
             out, created = write_versioned_sbom(
                 sbom=sbom,
@@ -799,7 +987,11 @@ def main() -> None:
                 subdir=subdir,
                 filename=filename,
             )
-            status = "generated new SBOM" if created else "SBOM version already exists"
+            status = (
+                "generated new SBOM security artifact"
+                if created
+                else "SBOM security artifact already exists"
+            )
             publish_paths = sbom_artifact_paths(out)
         if args.s3_uri:
             LOGGER.info("publishing SBOM artifacts to S3 count=%d", len(publish_paths))

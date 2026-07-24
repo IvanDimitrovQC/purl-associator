@@ -158,7 +158,7 @@ def expand_s3_sharded_indexes(
     if not shard_reads:
         return expanded
 
-    LOGGER.info("loading advisory-repodata shards count=%d", len(shard_reads))
+    LOGGER.info("loading advisory-channel shards count=%d", len(shard_reads))
     shard_results: list[tuple[int, dict[str, Any]] | None] = [None] * len(shard_reads)
     if workers == 1 or len(shard_reads) <= 1:
         for index, (subdir_index, shard_path) in enumerate(shard_reads):
@@ -193,9 +193,11 @@ def expand_s3_sharded_indexes(
         if result is None:
             continue
         subdir_index, shard = result
-        shard_packages = shard.get("packages")
+        shard_packages = shard.get("packages.conda")
         if not isinstance(shard_packages, dict):
-            raise DashboardDataError("advisory-repodata shard is missing packages")
+            shard_packages = shard.get("packages")
+        if not isinstance(shard_packages, dict):
+            raise DashboardDataError("advisory-channel shard is missing packages")
         packages = expanded[subdir_index].setdefault("packages", {})
         if not isinstance(packages, dict):
             raise DashboardDataError("expanded subdir packages must be an object")
@@ -432,13 +434,25 @@ def _indexed_vulnerabilities(osv: dict[str, Any]) -> list[dict[str, Any]]:
     return vulnerabilities
 
 
+def _current_sbom_record(record: dict[str, Any]) -> dict[str, Any]:
+    sboms = record.get("sboms")
+    if isinstance(sboms, dict):
+        preferred = sboms.get("sbom.v1")
+        if isinstance(preferred, dict):
+            return preferred
+        for value in sboms.values():
+            if isinstance(value, dict):
+                return value
+    return _as_dict(record.get("sbom"))
+
+
 def artifact_from_record(
     *,
     filename: str,
     record: dict[str, Any],
     vulnerabilities_by_advisory: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
-    sbom = _as_dict(record.get("sbom"))
+    sbom = _current_sbom_record(record)
     osv = _as_dict(record.get("osv"))
     sbom_current = _string_or_none(sbom.get("current"))
     osv_current = _string_or_none(osv.get("current"))
@@ -462,7 +476,9 @@ def artifact_from_record(
             "exists": _bool_exists(sbom_current),
             "path": sbom_current,
             "version": sbom.get("version"),
-            "input_sha256": sbom.get("input_sha256"),
+            "input_sha256": sbom.get("input_sha256")
+            if sbom.get("input_sha256") is not None
+            else sbom.get("sbom_input_sha256"),
             "mapping_sha256": sbom.get("mapping_sha256"),
         },
         "osv": {

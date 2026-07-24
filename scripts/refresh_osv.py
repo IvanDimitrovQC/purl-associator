@@ -27,7 +27,7 @@ from scripts.correlate_osv import (
     versioned_output_path,
     write_advisory,
 )
-from scripts.generate_sbom import DEFAULT_LOCAL_CHANNEL
+from scripts.generate_sbom import DEFAULT_LOCAL_CHANNEL, read_security_sbom_payload
 from scripts.load_progress import ProgressTracker
 from scripts.s3_publish import (
     Runner,
@@ -42,6 +42,7 @@ from scripts.s3_publish import (
     s3_uri_for_path,
     upload_files,
 )
+from scripts.s3_sbom_inventory import is_sbom_artifact_path
 
 
 LOGGER = logging.getLogger("scripts.refresh_osv")
@@ -83,14 +84,14 @@ def load_s3_sbom_source_inventory(path: Path) -> set[str]:
 
 
 def iter_sbom_paths(channel_root: Path) -> list[Path]:
+    security = channel_root.glob("*/*.sboms/*.conda")
     versioned = channel_root.glob("*/sboms/*/sbom-*.cdx.json")
     legacy = channel_root.glob("*/sboms/*.cdx.json")
-    return sorted([*versioned, *legacy])
+    return sorted([*security, *versioned, *legacy])
 
 
 def is_s3_sbom_artifact_path(path: str) -> bool:
-    name = Path(path).name
-    return "/sboms/" in path and name.startswith("sbom-") and name.endswith(".cdx.json")
+    return is_sbom_artifact_path(path)
 
 
 def filter_s3_sbom_artifact_paths(paths: list[str]) -> list[str]:
@@ -184,14 +185,24 @@ def _validate_workers(value: int, *, option: str) -> None:
         raise OsvError(f"{option} must be at least 1")
 
 
+def _is_security_sbom_path(path: Path) -> bool:
+    return path.name.endswith(".conda") and path.parent.name.endswith(".sboms")
+
+
+def _load_sbom_path(path: Path) -> dict:
+    if _is_security_sbom_path(path):
+        return read_security_sbom_payload(path)
+    return _load_json_path(path)
+
+
 def _load_sboms(sbom_paths: list[Path], *, workers: int) -> list[dict]:
     if workers == 1 or len(sbom_paths) <= 1:
-        return [_load_json_path(path) for path in sbom_paths]
+        return [_load_sbom_path(path) for path in sbom_paths]
 
     sboms: list[dict | None] = [None] * len(sbom_paths)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_load_json_path, path): index
+            executor.submit(_load_sbom_path, path): index
             for index, path in enumerate(sbom_paths)
         }
         for future in as_completed(futures):

@@ -17,6 +17,7 @@ class S3SbomInventoryTests(unittest.TestCase):
         paths = filter_sbom_inventory_paths(
             [
                 "channel-index.json",
+                f"noarch/demo-1.2.3-py_0.sboms/{'a' * 64}.conda",
                 "noarch/sboms/demo/sbom-abc.cdx.json",
                 "noarch/sboms/demo/event-abc.json",
                 "noarch/advisories/demo/osv-abc-def.json",
@@ -26,13 +27,14 @@ class S3SbomInventoryTests(unittest.TestCase):
         self.assertEqual(
             paths,
             [
+                f"noarch/demo-1.2.3-py_0.sboms/{'a' * 64}.conda",
                 "noarch/sboms/demo/sbom-abc.cdx.json",
             ],
         )
 
     def test_write_inventory_payload(self) -> None:
         object_paths = [
-            "noarch/sboms/demo/sbom-abc.cdx.json",
+            f"noarch/demo-1.2.3-py_0.sboms/{'a' * 64}.conda",
         ]
         payload = sbom_inventory_payload(
             s3_uri="s3://demo-bucket/prefix",

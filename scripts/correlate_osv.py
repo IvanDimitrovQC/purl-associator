@@ -23,6 +23,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
+from scripts.generate_sbom import read_security_sbom_payload
 from scripts.s3_publish import (
     S3PublishError,
     add_s3_args,
@@ -57,6 +58,19 @@ def _load_json_path(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise OsvError(f"{path}: expected a JSON object")
     return data
+
+
+def _is_security_sbom_path(path: Path) -> bool:
+    return path.name.endswith(".conda") and path.parent.name.endswith(".sboms")
+
+
+def _load_sbom_path(path: Path) -> dict[str, Any]:
+    if _is_security_sbom_path(path):
+        try:
+            return read_security_sbom_payload(path)
+        except Exception as exc:
+            raise OsvError(str(exc)) from exc
+    return _load_json_path(path)
 
 
 def _canonical_json(data: Any) -> str:
@@ -646,6 +660,15 @@ def finalized_advisory(advisory: dict[str, Any]) -> dict[str, Any]:
 
 
 def default_output_path(sbom_path: Path) -> Path:
+    if sbom_path.name.endswith(".conda") and sbom_path.parent.name.endswith(".sboms"):
+        sbom_version = sbom_path.name.removesuffix(".conda")
+        artifact_filename = f"{sbom_path.parent.name.removesuffix('.sboms')}.conda"
+        return (
+            sbom_path.parent.parent
+            / "advisories"
+            / artifact_filename
+            / f"osv-{sbom_version}.json"
+        )
     if (
         sbom_path.name.startswith("sbom-")
         and sbom_path.name.endswith(".cdx.json")
@@ -666,6 +689,15 @@ def default_output_path(sbom_path: Path) -> Path:
 
 def versioned_output_path(sbom_path: Path, advisory: dict[str, Any]) -> Path:
     correlation_hash = advisory_content_hash(advisory)
+    if sbom_path.name.endswith(".conda") and sbom_path.parent.name.endswith(".sboms"):
+        sbom_version = sbom_path.name.removesuffix(".conda")
+        artifact_filename = f"{sbom_path.parent.name.removesuffix('.sboms')}.conda"
+        return (
+            sbom_path.parent.parent
+            / "advisories"
+            / artifact_filename
+            / f"osv-{sbom_version}-{correlation_hash}.json"
+        )
     if (
         sbom_path.name.startswith("sbom-")
         and sbom_path.name.endswith(".cdx.json")
@@ -731,7 +763,7 @@ def main() -> None:
     try:
         if args.out and args.s3_uri:
             raise OsvError("--s3-uri cannot be used together with --out")
-        sbom = _load_json_path(args.sbom)
+        sbom = _load_sbom_path(args.sbom)
         advisory = correlate_sbom(
             sbom, source_sbom=str(args.sbom), api_url=args.api_url
         )

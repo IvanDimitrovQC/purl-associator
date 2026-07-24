@@ -154,6 +154,42 @@ class S3PublishTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("s3", calls[1])
         self.assertIn("cp", calls[1])
+        self.assertEqual(
+            calls[1][calls[1].index("--content-type") + 1],
+            "application/json",
+        )
+
+    def test_upload_file_uses_binary_content_type_for_conda_artifacts(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(
+            cmd: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            if "head-object" in cmd:
+                return subprocess.CompletedProcess(cmd, 255, "", "Not Found")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local-advisory-channel"
+            path = root / "noarch" / "demo-1.2.3-py_0.sboms" / (
+                f"{'a' * 64}.conda"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"conda")
+
+            result = upload_file(
+                local_path=path,
+                root=root,
+                s3_uri="s3://demo-bucket/prefix",
+                runner=runner,
+            )
+
+        self.assertTrue(result.uploaded)
+        self.assertEqual(
+            calls[1][calls[1].index("--content-type") + 1],
+            "application/octet-stream",
+        )
 
     def test_upload_files_runs_with_workers(self) -> None:
         calls: list[list[str]] = []

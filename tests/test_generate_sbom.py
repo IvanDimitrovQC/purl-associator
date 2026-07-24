@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from scripts.generate_sbom import (
+    SECURITY_METADATA_NAME,
+    SECURITY_SBOM_PAYLOAD_NAME,
     add_version_to_purl,
     build_cyclonedx_sbom,
     generate_sbom,
@@ -169,7 +173,7 @@ class GenerateSbomTests(unittest.TestCase):
         self.assertEqual(subdir, "noarch")
         self.assertEqual(sbom["components"][0]["purl"], "pkg:pypi/demo-pkg@1.2.3")
 
-    def test_write_versioned_sbom_is_idempotent(self) -> None:
+    def test_write_versioned_sbom_creates_security_conda_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             index_path, payload_path = self._write_demo_mapping(root)
@@ -198,13 +202,36 @@ class GenerateSbomTests(unittest.TestCase):
                 root / "channel",
                 subdir="noarch",
                 filename="demo-1.2.3-py_0.conda",
-                version=version,
+                version=first_path.stem,
             )
+            with zipfile.ZipFile(first_path) as artifact:
+                names = sorted(artifact.namelist())
+                security = json.loads(artifact.read(SECURITY_METADATA_NAME))
+                payload_bytes = artifact.read(SECURITY_SBOM_PAYLOAD_NAME)
+                payload = json.loads(payload_bytes)
 
             self.assertEqual(first_path, second_path)
             self.assertTrue(first_created)
             self.assertFalse(second_created)
             self.assertEqual(first_path, expected_sbom_path)
+            self.assertRegex(first_path.stem, r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                first_path.parent,
+                root / "channel" / "noarch" / "demo-1.2.3-py_0.sboms",
+            )
+            self.assertEqual(first_path.suffix, ".conda")
+            self.assertEqual(names, [SECURITY_METADATA_NAME, SECURITY_SBOM_PAYLOAD_NAME])
+            self.assertEqual(security["metadata"]["kind"], "SBOM")
+            self.assertEqual(security["metadata"]["data_schema"], "sbom.v1")
+            self.assertIsNone(security["metadata"]["parent_sha256"])
+            self.assertIsInstance(security["metadata"]["created_on"], int)
+            payload_metadata = security["artifacts"][SECURITY_SBOM_PAYLOAD_NAME]
+            self.assertEqual(payload_metadata["size"], len(payload_bytes))
+            self.assertEqual(
+                payload_metadata["sha256"],
+                hashlib.sha256(payload_bytes).hexdigest(),
+            )
+            self.assertEqual(get_sbom_version(payload), version)
 
     def test_sbom_version_tracks_only_significant_content(self) -> None:
         record = {

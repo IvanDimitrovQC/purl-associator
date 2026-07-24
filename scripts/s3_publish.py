@@ -208,6 +208,14 @@ def s3_uri_for_relative_path(*, relative_path: str, s3_uri: str) -> str:
     return f"s3://{location.bucket}/{key}"
 
 
+def content_type_for_path(path: Path) -> str:
+    if path.name.endswith(".json"):
+        return "application/json"
+    if path.name.endswith(".conda"):
+        return "application/octet-stream"
+    return "application/octet-stream"
+
+
 def _relative_key(key: str, *, prefix: str) -> str | None:
     clean_prefix = prefix.strip("/")
     if not clean_prefix:
@@ -403,7 +411,7 @@ def upload_file(
             str(local_path),
             destination,
             "--content-type",
-            "application/json",
+            content_type_for_path(local_path),
             "--only-show-errors",
             "--no-progress",
         ],

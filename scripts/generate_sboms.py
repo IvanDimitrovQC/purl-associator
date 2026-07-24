@@ -29,11 +29,12 @@ from scripts.generate_sbom import (
     _iter_repodata_records,
     _load_json_path,
     _load_json_ref,
-    expected_sbom_artifact_paths,
     generate_sbom_from_record,
     generate_sbom_from_mapping,
+    get_security_sbom_artifact_sha256,
     purl_type,
     sbom_artifact_paths,
+    sbom_output_path,
     write_versioned_sbom,
 )
 from scripts.load_progress import ProgressTracker
@@ -46,6 +47,7 @@ from scripts.s3_publish import (
     paths_present_in_inventory,
     upload_files,
 )
+from scripts.s3_sbom_inventory import is_sbom_artifact_path
 
 DEFAULT_REPODATA_CACHE = Path(".cache") / "repodata"
 DEFAULT_REPODATA_CACHE_SECONDS = 1200
@@ -734,32 +736,6 @@ def generate_many(
             item.record is not None,
         )
         if item.record is not None and item.filename is not None:
-            expected_paths = expected_sbom_artifact_paths(
-                mapping=item.mapping,
-                record=item.record,
-                root=out_dir,
-                subdir=item.subdir,
-                filename=item.filename,
-                channel=channel,
-            )
-            if skip_artifacts is not None and skip_artifacts(expected_paths):
-                LOGGER.info(
-                    "skipping inventory-present SBOM package=%s subdir=%s "
-                    "filename=%s path=%s",
-                    item.name,
-                    item.subdir,
-                    item.filename,
-                    expected_paths[0],
-                )
-                return GeneratedSbom(
-                    index=item.index,
-                    name=item.name,
-                    subdir=item.subdir,
-                    filename=item.filename,
-                    path=expected_paths[0],
-                    created=False,
-                    inventory_skipped=True,
-                )
             filename, selected_subdir, sbom = generate_sbom_from_record(
                 item.mapping,
                 record=item.record,
@@ -779,6 +755,31 @@ def generate_many(
                 repodata_ref=None,
                 purl_type_filter=purl_type_filter,
                 repodata=repodata_for_subdir(item.subdir),
+            )
+        artifact_sha256 = get_security_sbom_artifact_sha256(sbom)
+        expected_path = sbom_output_path(
+            out_dir,
+            subdir=selected_subdir,
+            filename=filename,
+            version=artifact_sha256,
+        )
+        if skip_artifacts is not None and skip_artifacts([expected_path]):
+            LOGGER.info(
+                "skipping inventory-present SBOM package=%s subdir=%s "
+                "filename=%s path=%s",
+                item.name,
+                selected_subdir,
+                filename,
+                expected_path,
+            )
+            return GeneratedSbom(
+                index=item.index,
+                name=item.name,
+                subdir=selected_subdir,
+                filename=filename,
+                path=expected_path,
+                created=False,
+                inventory_skipped=True,
             )
         out, created = write_versioned_sbom(
             sbom=sbom,
@@ -1058,6 +1059,11 @@ def main() -> None:
             raise SbomError("--s3-sbom-inventory requires --s3-uri")
         if args.skip_existing_s3_sboms and not args.s3_sbom_inventory:
             raise SbomError("--skip-existing-s3-sboms requires --s3-sbom-inventory")
+        if args.update_index and args.skip_existing_s3_sboms:
+            raise SbomError(
+                "--update-index cannot be combined with --skip-existing-s3-sboms; "
+                "run advisory:index from the S3 inventory after the refresh instead"
+            )
         if args.s3_sbom_inventory:
             s3_inventory = load_s3_sbom_inventory(args.s3_sbom_inventory)
             LOGGER.info(
@@ -1084,9 +1090,13 @@ def main() -> None:
         if index_state:
             with publish_lock:
                 for path in paths:
-                    if path.name.startswith("sbom-") and path.name.endswith(
-                        ".cdx.json"
-                    ):
+                    try:
+                        relative = (
+                            path.resolve().relative_to(args.out_dir.resolve()).as_posix()
+                        )
+                    except ValueError:
+                        continue
+                    if is_sbom_artifact_path(relative):
                         LOGGER.info("updating advisory index from SBOM path=%s", path)
                         index_state.update_sbom(path)
         if not args.s3_uri:

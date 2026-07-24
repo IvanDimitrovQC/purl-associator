@@ -15,6 +15,7 @@ from scripts.generate_sboms import (
     load_mapping_entries,
     paths_present_in_inventory,
 )
+from scripts.generate_sbom import read_security_sbom_payload
 
 
 class GenerateSbomsTests(unittest.TestCase):
@@ -158,7 +159,7 @@ class GenerateSbomsTests(unittest.TestCase):
                 )
 
             out = result.generated[0]
-            sbom = json.loads(out.read_text())
+            sbom = read_security_sbom_payload(out)
             progress_data = json.loads((root / "progress.json").read_text())
 
         self.assertEqual(len(result.generated), 1)
@@ -168,7 +169,8 @@ class GenerateSbomsTests(unittest.TestCase):
         self.assertEqual(result.skipped, 1)
         self.assertEqual(result.errors, [])
         self.assertEqual(sbom["components"][0]["purl"], "pkg:pypi/demo-pkg@1.2.3")
-        self.assertTrue(out.name.startswith("sbom-"))
+        self.assertRegex(out.name, r"^[0-9a-f]{64}\.conda$")
+        self.assertEqual(out.parent.name, "demo-1.2.3-py_0.sboms")
         self.assertEqual(len(published), 1)
         self.assertEqual(progress_data["counts"]["processed"], 1)
 
@@ -242,7 +244,7 @@ class GenerateSbomsTests(unittest.TestCase):
                     versions_per_package=2,
                 )
 
-            sboms = [json.loads(path.read_text()) for path in result.generated]
+            sboms = [read_security_sbom_payload(path) for path in result.generated]
             filenames = {path.parent.name for path in result.generated}
             purls = {sbom["components"][0]["purl"] for sbom in sboms}
 
@@ -254,7 +256,7 @@ class GenerateSbomsTests(unittest.TestCase):
             purls,
             {"pkg:pypi/demo-pkg@1.10.0", "pkg:pypi/demo-pkg@1.2.0"},
         )
-        self.assertIn("demo-1.2.0-py_1.conda", filenames)
+        self.assertIn("demo-1.2.0-py_1.sboms", filenames)
 
     def test_generate_many_can_skip_inventory_present_historical_sboms(self) -> None:
         entries = [
@@ -321,14 +323,19 @@ class GenerateSbomsTests(unittest.TestCase):
     def test_s3_sbom_inventory_matches_channel_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "local-advisory-channel"
-            sbom_path = root / "noarch" / "sboms" / "demo" / "sbom-abc.cdx.json"
+            sbom_path = (
+                root
+                / "noarch"
+                / "demo-1.2.3-py_0.sboms"
+                / f"{'a' * 64}.conda"
+            )
             inventory_path = Path(tmp) / "inventory.json"
             inventory_path.write_text(
                 json.dumps(
                     {
                         "schema_version": 1,
                         "objects": [
-                            "noarch/sboms/demo/sbom-abc.cdx.json",
+                            f"noarch/demo-1.2.3-py_0.sboms/{'a' * 64}.conda",
                         ],
                     }
                 )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from scripts.refresh_osv import (
     refresh_osv,
     stage_s3_sboms,
 )
+from scripts.generate_sbom import build_security_sbom_artifact_bytes
 from scripts.s3_publish import paths_present_in_inventory
 
 
@@ -98,6 +100,36 @@ class RefreshOsvTests(unittest.TestCase):
         self.assertEqual(published, first.outputs)
         self.assertEqual(progress_data["counts"]["processed"], 1)
 
+    def test_refresh_osv_reads_security_conda_sbom_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local-advisory-channel"
+            artifact = build_security_sbom_artifact_bytes(sbom=self._sbom())
+            artifact_sha256 = hashlib.sha256(artifact).hexdigest()
+            sbom_path = (
+                root
+                / "noarch"
+                / "demo-1.2.3-py_0.sboms"
+                / f"{artifact_sha256}.conda"
+            )
+            sbom_path.parent.mkdir(parents=True)
+            sbom_path.write_bytes(artifact)
+            osv_results = {
+                "pkg:pypi/demo-pkg@1.2.3": [
+                    {"id": "GHSA-demo-0001", "modified": "2026-01-01T00:00:00Z"}
+                ]
+            }
+
+            with patch(
+                "scripts.refresh_osv.query_osv_chunked", return_value=osv_results
+            ):
+                result = refresh_osv(channel_root=root, batch_size=10)
+
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.queried_purls, 1)
+        self.assertEqual(result.written, 1)
+        self.assertEqual(result.outputs[0].parent.name, "demo-1.2.3-py_0.conda")
+        self.assertTrue(result.outputs[0].name.startswith(f"osv-{artifact_sha256}-"))
+
     def test_s3_osv_inventory_matches_channel_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "local-advisory-channel"
@@ -134,16 +166,22 @@ class RefreshOsvTests(unittest.TestCase):
             )
 
     def test_filter_s3_sbom_artifact_paths_excludes_events_and_indexes(self) -> None:
+        artifact_path = f"noarch/demo-1.2.3-py_0.sboms/{'a' * 64}.conda"
         self.assertEqual(
             filter_s3_sbom_artifact_paths(
                 [
                     "noarch/sboms/demo/sbom-abc.cdx.json",
+                    artifact_path,
                     "noarch/sboms/demo/event-abc.json",
-                    "noarch/advisory-repodata.json",
+                    "noarch/demo-1.2.3-py_0.sboms/event-abc.json",
+                    "noarch/advisory-channel.json",
                     "channel-index.json",
                 ]
             ),
-            ["noarch/sboms/demo/sbom-abc.cdx.json"],
+            [
+                artifact_path,
+                "noarch/sboms/demo/sbom-abc.cdx.json",
+            ],
         )
 
     def test_stage_s3_sboms_downloads_filtered_objects(self) -> None:

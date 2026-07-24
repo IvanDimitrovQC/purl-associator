@@ -81,20 +81,33 @@ def _sbom_version_from_path(path: str) -> str | None:
     name = Path(path).name
     if name.startswith("sbom-") and name.endswith(".cdx.json"):
         return name.removeprefix("sbom-").removesuffix(".cdx.json")
+    stem = name.removesuffix(".conda")
+    if (
+        name.endswith(".conda")
+        and len(stem) == 64
+        and all(char in "0123456789abcdef" for char in stem)
+    ):
+        return stem
     return None
 
 
 def _artifact_key(path: str) -> tuple[str, str] | None:
     parts = Path(path).parts
-    if len(parts) < 4 or parts[1] != "sboms":
-        return None
-    return parts[0], parts[2]
+    if len(parts) >= 3 and parts[1].endswith(".sboms"):
+        filename = f"{parts[1].removesuffix('.sboms')}.conda"
+        return parts[0], filename
+    if len(parts) >= 4 and parts[1] == "sboms":
+        return parts[0], parts[2]
+    return None
 
 
 def local_sbom_paths(channel_root: Path) -> list[str]:
     if not channel_root.exists():
         return []
-    paths = [*channel_root.glob("*/sboms/*/sbom-*.cdx.json")]
+    paths = [
+        *channel_root.glob("*/*.sboms/*.conda"),
+        *channel_root.glob("*/sboms/*/sbom-*.cdx.json"),
+    ]
     out: list[str] = []
     for path in paths:
         try:

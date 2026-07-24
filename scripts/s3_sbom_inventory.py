@@ -19,7 +19,16 @@ LOGGER = logging.getLogger("scripts.s3_sbom_inventory")
 
 def is_sbom_artifact_path(path: str) -> bool:
     name = Path(path).name
-    return "/sboms/" in path and name.startswith("sbom-") and name.endswith(".cdx.json")
+    if "/sboms/" in path and name.startswith("sbom-") and name.endswith(".cdx.json"):
+        return True
+    parts = Path(path).parts
+    return (
+        len(parts) >= 3
+        and parts[-2].endswith(".sboms")
+        and len(name.removesuffix(".conda")) == 64
+        and name.endswith(".conda")
+        and all(char in "0123456789abcdef" for char in name.removesuffix(".conda"))
+    )
 
 
 def filter_sbom_inventory_paths(paths: list[str]) -> list[str]:
