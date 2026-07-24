@@ -187,6 +187,14 @@ function severityLabel(severity: string | null | undefined): string {
   return severity.toUpperCase();
 }
 
+function severityDisplay(vuln: AdvisoryVulnerability): string {
+  const label = severityLabel(vuln.severity);
+  if (label === "Unknown" || typeof vuln.severity_score !== "number") {
+    return label;
+  }
+  return `${label} ${vuln.severity_score.toFixed(1)}`;
+}
+
 function severityTitle(vuln: AdvisoryVulnerability): string {
   const pieces = [`Severity: ${severityLabel(vuln.severity)}`];
   if (typeof vuln.severity_score === "number") {
@@ -848,7 +856,7 @@ function VulnerabilityList({
               )}
               <span title={severityTitle(vuln)}>
                 <Badge theme={theme} tone={severityTone(vuln.severity)}>
-                  {severityLabel(vuln.severity)}
+                  {severityDisplay(vuln)}
                 </Badge>
               </span>
             </div>
