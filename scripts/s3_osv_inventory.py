@@ -19,20 +19,53 @@ LOGGER = logging.getLogger("scripts.s3_osv_inventory")
 
 def is_osv_advisory_path(path: str) -> bool:
     name = Path(path).name
-    return "/advisories/" in path and name.startswith("osv-") and name.endswith(".json")
+    parts = Path(path).parts
+    if "/advisories/" in path and name.startswith("osv-") and name.endswith(".json"):
+        return True
+    return (
+        len(parts) >= 3
+        and parts[-2].endswith(".advisories")
+        and name.endswith(".conda")
+        and len(name.removesuffix(".conda")) == 64
+        and all(char in "0123456789abcdef" for char in name.removesuffix(".conda"))
+    )
+
+
+def is_osv_related_artifact_path(path: str) -> bool:
+    if is_osv_advisory_path(path):
+        return True
+    name = Path(path).name
+    parts = Path(path).parts
+    if not (
+        name.endswith(".conda")
+        and len(name.removesuffix(".conda")) == 64
+        and all(char in "0123456789abcdef" for char in name.removesuffix(".conda"))
+    ):
+        return False
+    return (
+        (len(parts) >= 3 and parts[0] == "cves")
+        or (len(parts) >= 4 and parts[-3].endswith(".matches"))
+    )
 
 
 def filter_osv_inventory_paths(paths: list[str]) -> list[str]:
     return sorted(path for path in dict.fromkeys(paths) if is_osv_advisory_path(path))
 
 
+def filter_osv_related_inventory_paths(paths: list[str]) -> list[str]:
+    return sorted(
+        path for path in dict.fromkeys(paths) if is_osv_related_artifact_path(path)
+    )
+
+
 def osv_inventory_payload(*, s3_uri: str, object_paths: list[str]) -> dict[str, Any]:
+    advisory_count = sum(1 for path in object_paths if is_osv_advisory_path(path))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "s3_uri": s3_uri,
         "object_count": len(object_paths),
-        "advisory_count": len(object_paths),
+        "advisory_count": advisory_count,
         "objects": object_paths,
     }
 
@@ -71,7 +104,7 @@ def main() -> None:
             profile=args.s3_profile,
             region=args.s3_region,
         )
-        object_paths = filter_osv_inventory_paths(all_paths)
+        object_paths = filter_osv_related_inventory_paths(all_paths)
         payload = osv_inventory_payload(s3_uri=args.s3_uri, object_paths=object_paths)
         out = write_inventory(payload=payload, out=args.out)
     except S3PublishError as exc:

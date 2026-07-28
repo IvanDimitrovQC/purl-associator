@@ -13,6 +13,7 @@ from scripts.advisory_index import (
     build_indexes,
     build_indexes_from_s3,
 )
+from scripts.correlate_osv import write_advisory_artifacts
 from scripts.generate_sbom import (
     build_security_sbom_artifact_bytes,
     write_versioned_sbom,
@@ -158,6 +159,34 @@ class AdvisoryIndexTests(unittest.TestCase):
         self.assertEqual(record["osv"]["finding_ids"], ["GHSA-demo-0001"])
         self.assertEqual(record["osv"]["vulnerabilities"][0]["id"], "GHSA-demo-0001")
         self.assertEqual(record["osv"]["vulnerabilities"][0]["severity"], "MEDIUM")
+
+    def test_build_indexes_reads_security_advisory_rollups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local-advisory-channel"
+            sbom_path = self._write_security_sbom(root)
+            advisory = {
+                **self._advisory(),
+                "source_sbom": (
+                    f"noarch/demo-1.2.3-py_0.sboms/{sbom_path.name}"
+                ),
+            }
+            write_advisory_artifacts(advisory, sbom_path=sbom_path)
+
+            build_indexes(channel_root=root, channel="conda-forge")
+            subdir_index = json.loads(
+                (root / "noarch" / "advisory-channel.json").read_text()
+            )
+            shard_entry = subdir_index["shards"]["demo"]
+            shard = json.loads(
+                (root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json")
+                .read_text()
+            )
+
+        record = shard["packages.conda"]["demo-1.2.3-py_0.conda"]
+        self.assertIn(".advisories/", record["osv"]["current"])
+        self.assertTrue(record["osv"]["current"].endswith(".conda"))
+        self.assertEqual(record["osv"]["finding_ids"], ["GHSA-demo-0001"])
+        self.assertEqual(record["osv"]["vulnerabilities"][0]["id"], "GHSA-demo-0001")
 
     def test_advisory_index_state_loads_sharded_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

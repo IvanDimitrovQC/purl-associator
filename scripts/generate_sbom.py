@@ -41,7 +41,15 @@ SBOM_INPUT_SCHEMA_VERSION = 1
 SECURITY_ARTIFACT_KIND_SBOM = "SBOM"
 SECURITY_SBOM_SCHEMA = "v1"
 SECURITY_SBOM_PAYLOAD_NAME = f"sbom.{SECURITY_SBOM_SCHEMA}.json"
+SECURITY_CVE_PAYLOAD_NAME = "cve.v1.json"
+SECURITY_MATCH_PAYLOAD_NAME = "match.v1.json"
+SECURITY_ADVISORIES_PAYLOAD_NAME = "advisories.v1.json"
 SECURITY_METADATA_NAME = "info/security.json"
+DEFAULT_SECURITY_CREATED_ON = 315532800
+DEFAULT_SBOM_TIMESTAMP = datetime.fromtimestamp(
+    DEFAULT_SECURITY_CREATED_ON,
+    UTC,
+).isoformat(timespec="seconds")
 SBOM_RELEVANT_MAPPING_FIELDS = (
     "name",
     "version",
@@ -401,6 +409,37 @@ def _properties(*items: tuple[str, Any]) -> list[dict[str, str]]:
     return out
 
 
+def _record_timestamp_seconds(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+    elif isinstance(value, str):
+        try:
+            timestamp = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if timestamp <= 0:
+        return None
+    # Conda repodata timestamps are usually milliseconds since the Unix epoch.
+    if timestamp >= 10_000_000_000:
+        timestamp /= 1000
+    try:
+        datetime.fromtimestamp(timestamp, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return int(timestamp)
+
+
+def _sbom_metadata_timestamp(record: dict[str, Any]) -> str:
+    timestamp = _record_timestamp_seconds(record.get("timestamp"))
+    if timestamp is None:
+        return DEFAULT_SBOM_TIMESTAMP
+    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds")
+
+
 def build_cyclonedx_sbom(
     *,
     mapping: dict[str, Any],
@@ -484,7 +523,7 @@ def build_cyclonedx_sbom(
         "serialNumber": f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, subject_ref)}",
         "version": 1,
         "metadata": {
-            "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+            "timestamp": _sbom_metadata_timestamp(record),
             "component": subject,
         },
         "components": [upstream],
@@ -523,11 +562,11 @@ def _created_on_from_sbom(sbom: dict[str, Any]) -> int:
             return int(parsed.timestamp())
         except ValueError:
             pass
-    return int(datetime.now(UTC).timestamp())
+    return DEFAULT_SECURITY_CREATED_ON
 
 
 def _zip_info(name: str, *, created_on: int) -> zipfile.ZipInfo:
-    timestamp = max(created_on, 315532800)
+    timestamp = max(created_on, DEFAULT_SECURITY_CREATED_ON)
     date_time = datetime.fromtimestamp(timestamp, UTC).timetuple()[:6]
     info = zipfile.ZipInfo(name, date_time)
     info.compress_type = zipfile.ZIP_DEFLATED
@@ -535,37 +574,46 @@ def _zip_info(name: str, *, created_on: int) -> zipfile.ZipInfo:
     return info
 
 
-def build_security_sbom_metadata(
+def build_security_artifact_metadata(
     *,
-    sbom_payload: bytes,
+    kind: str,
+    data_schema: str,
+    payload_name: str,
+    payload: bytes,
     created_on: int,
     parent_sha256: str | None = None,
 ) -> dict[str, Any]:
     return {
         "metadata": {
-            "kind": SECURITY_ARTIFACT_KIND_SBOM,
-            "data_schema": f"sbom.{SECURITY_SBOM_SCHEMA}",
+            "kind": kind,
+            "data_schema": data_schema,
             "parent_sha256": parent_sha256,
             "created_on": created_on,
         },
         "artifacts": {
-            SECURITY_SBOM_PAYLOAD_NAME: {
-                "sha256": _sha256_bytes(sbom_payload),
-                "size": len(sbom_payload),
+            payload_name: {
+                "sha256": _sha256_bytes(payload),
+                "size": len(payload),
             },
         },
     }
 
 
-def build_security_sbom_artifact_bytes(
+def build_security_artifact_bytes(
     *,
-    sbom: dict[str, Any],
+    payload: dict[str, Any],
+    kind: str,
+    data_schema: str,
+    payload_name: str,
+    created_on: int,
     parent_sha256: str | None = None,
 ) -> bytes:
-    created_on = _created_on_from_sbom(sbom)
-    sbom_payload = _pretty_json_bytes(sbom)
-    security = build_security_sbom_metadata(
-        sbom_payload=sbom_payload,
+    payload_bytes = _pretty_json_bytes(payload)
+    security = build_security_artifact_metadata(
+        kind=kind,
+        data_schema=data_schema,
+        payload_name=payload_name,
+        payload=payload_bytes,
         created_on=created_on,
         parent_sha256=parent_sha256,
     )
@@ -577,10 +625,60 @@ def build_security_sbom_artifact_bytes(
             security_payload,
         )
         archive.writestr(
-            _zip_info(SECURITY_SBOM_PAYLOAD_NAME, created_on=created_on),
-            sbom_payload,
+            _zip_info(payload_name, created_on=created_on),
+            payload_bytes,
         )
     return buffer.getvalue()
+
+
+def build_security_sbom_metadata(
+    *,
+    sbom_payload: bytes,
+    created_on: int,
+    parent_sha256: str | None = None,
+) -> dict[str, Any]:
+    return build_security_artifact_metadata(
+        kind=SECURITY_ARTIFACT_KIND_SBOM,
+        data_schema=f"sbom.{SECURITY_SBOM_SCHEMA}",
+        payload_name=SECURITY_SBOM_PAYLOAD_NAME,
+        payload=sbom_payload,
+        created_on=created_on,
+        parent_sha256=parent_sha256,
+    )
+
+
+def build_security_sbom_artifact_bytes(
+    *,
+    sbom: dict[str, Any],
+    parent_sha256: str | None = None,
+) -> bytes:
+    return build_security_artifact_bytes(
+        payload=sbom,
+        kind=SECURITY_ARTIFACT_KIND_SBOM,
+        data_schema=f"sbom.{SECURITY_SBOM_SCHEMA}",
+        payload_name=SECURITY_SBOM_PAYLOAD_NAME,
+        created_on=_created_on_from_sbom(sbom),
+        parent_sha256=parent_sha256,
+    )
+
+
+def security_artifact_sha256(
+    *,
+    payload: dict[str, Any],
+    kind: str,
+    data_schema: str,
+    payload_name: str,
+    created_on: int,
+) -> str:
+    return _sha256_bytes(
+        build_security_artifact_bytes(
+            payload=payload,
+            kind=kind,
+            data_schema=data_schema,
+            payload_name=payload_name,
+            created_on=created_on,
+        )
+    )
 
 
 def get_security_sbom_artifact_sha256(sbom: dict[str, Any]) -> str:
@@ -596,10 +694,10 @@ def _is_security_artifact_name(path: Path) -> bool:
     )
 
 
-def read_security_sbom_payload(path: Path) -> dict[str, Any]:
+def read_security_artifact_payload(path: Path, *, payload_name: str) -> dict[str, Any]:
     try:
         with zipfile.ZipFile(path) as archive:
-            with archive.open(SECURITY_SBOM_PAYLOAD_NAME) as payload_file:
+            with archive.open(payload_name) as payload_file:
                 payload = json.load(payload_file)
     except (
         FileNotFoundError,
@@ -607,10 +705,44 @@ def read_security_sbom_payload(path: Path) -> dict[str, Any]:
         json.JSONDecodeError,
         zipfile.BadZipFile,
     ) as exc:
-        raise SbomError(f"{path}: invalid SBOM security artifact: {exc}") from exc
+        raise SbomError(f"{path}: invalid security artifact: {exc}") from exc
     if not isinstance(payload, dict):
-        raise SbomError(f"{path}: SBOM payload must be a JSON object")
+        raise SbomError(f"{path}: security artifact payload must be a JSON object")
     return payload
+
+
+def read_security_sbom_payload(path: Path) -> dict[str, Any]:
+    return read_security_artifact_payload(path, payload_name=SECURITY_SBOM_PAYLOAD_NAME)
+
+
+def write_security_artifact(
+    *,
+    payload: dict[str, Any],
+    out_dir: Path,
+    kind: str,
+    data_schema: str,
+    payload_name: str,
+    created_on: int,
+    dry_run: bool = False,
+) -> tuple[Path, bool]:
+    artifact_bytes = build_security_artifact_bytes(
+        payload=payload,
+        kind=kind,
+        data_schema=data_schema,
+        payload_name=payload_name,
+        created_on=created_on,
+    )
+    artifact_sha256 = _sha256_bytes(artifact_bytes)
+    out = out_dir / f"{artifact_sha256}.conda"
+    if dry_run:
+        return out, not out.exists()
+    if out.exists():
+        return out, False
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.tmp")
+    tmp.write_bytes(artifact_bytes)
+    tmp.replace(out)
+    return out, True
 
 
 def find_existing_security_sbom_artifact(

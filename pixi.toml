@@ -27,6 +27,7 @@ python = ">=3.13,<3.14"
 [feature.lite.tasks]
 "mappings:merge" = "python -m scripts.merge_mappings"
 "mappings:validate" = "python -m scripts.validate"
+"mappings:select-top" = "python -m scripts.select_top_mappings"
 "sbom:generate" = "python -m scripts.generate_sbom"
 "sbom:generate-many" = "python -m scripts.generate_sboms"
 "sbom:refresh" = "python -m scripts.generate_sboms mappings/auto.json --cache-dir .cache/repodata"

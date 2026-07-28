@@ -32,6 +32,7 @@ from scripts.generate_sbom import (
     generate_sbom_from_record,
     generate_sbom_from_mapping,
     get_security_sbom_artifact_sha256,
+    get_sbom_version,
     purl_type,
     sbom_artifact_paths,
     sbom_output_path,
@@ -100,6 +101,7 @@ class SbomWorkItem:
 
 ArtifactHandler = Callable[[list[Path]], None]
 ArtifactSkipPredicate = Callable[[list[Path]], bool]
+LogicalArtifactSkipPredicate = Callable[[Path, str], Path | None]
 
 
 def load_s3_sbom_inventory(path: Path) -> set[str]:
@@ -107,6 +109,29 @@ def load_s3_sbom_inventory(path: Path) -> set[str]:
         return load_s3_object_inventory(path)
     except S3PublishError as exc:
         raise SbomError(str(exc)) from exc
+
+
+def load_s3_logical_sbom_inventory(path: Path) -> dict[tuple[str, str], str]:
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except FileNotFoundError as exc:
+        raise SbomError(f"{path}: file does not exist") from exc
+    except json.JSONDecodeError as exc:
+        raise SbomError(f"{path}: invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SbomError(f"{path}: expected a JSON object")
+    logical = data.get("logical_sboms")
+    if not isinstance(logical, dict):
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    for artifact_dir, versions in logical.items():
+        if not isinstance(artifact_dir, str) or not isinstance(versions, dict):
+            continue
+        for sbom_version, relative_path in versions.items():
+            if isinstance(sbom_version, str) and isinstance(relative_path, str):
+                out[(artifact_dir, sbom_version)] = relative_path
+    return out
 
 
 def _mapping_with_name(name: str, entry: dict[str, Any]) -> dict[str, Any]:
@@ -574,6 +599,7 @@ def generate_many(
     artifact_subdirs: str = "mapped",
     artifact_selection: str = ARTIFACT_SELECTION_LATEST,
     skip_artifacts: ArtifactSkipPredicate | None = None,
+    skip_logical_artifact: LogicalArtifactSkipPredicate | None = None,
 ) -> BatchResult:
     _validate_workers(workers, option="--workers")
     _validate_versions_per_package(versions_per_package)
@@ -763,6 +789,30 @@ def generate_many(
             filename=filename,
             version=artifact_sha256,
         )
+        sbom_version = get_sbom_version(sbom)
+        if skip_logical_artifact is not None:
+            existing_path = skip_logical_artifact(expected_path, sbom_version)
+            if existing_path is not None:
+                LOGGER.info(
+                    "skipping logical inventory-present SBOM package=%s "
+                    "subdir=%s filename=%s path=%s existing_path=%s "
+                    "sbom_version=%s",
+                    item.name,
+                    selected_subdir,
+                    filename,
+                    expected_path,
+                    existing_path,
+                    sbom_version,
+                )
+                return GeneratedSbom(
+                    index=item.index,
+                    name=item.name,
+                    subdir=selected_subdir,
+                    filename=filename,
+                    path=existing_path,
+                    created=False,
+                    inventory_skipped=True,
+                )
         if skip_artifacts is not None and skip_artifacts([expected_path]):
             LOGGER.info(
                 "skipping inventory-present SBOM package=%s subdir=%s "
@@ -987,7 +1037,8 @@ def main() -> None:
         action="store_true",
         help=(
             "with --s3-sbom-inventory, skip local SBOM generation when the exact "
-            "SBOM path already exists in the inventory"
+            "SBOM path exists in the inventory, or when an --include-metadata "
+            "inventory has the same artifact directory and SBOM version"
         ),
     )
     add_s3_args(parser)
@@ -1054,6 +1105,7 @@ def main() -> None:
     cleaned = 0
     inventory_existing = 0
     s3_inventory: set[str] | None = None
+    s3_logical_inventory: dict[tuple[str, str], str] = {}
     try:
         if args.s3_sbom_inventory and not args.s3_uri:
             raise SbomError("--s3-sbom-inventory requires --s3-uri")
@@ -1066,10 +1118,14 @@ def main() -> None:
             )
         if args.s3_sbom_inventory:
             s3_inventory = load_s3_sbom_inventory(args.s3_sbom_inventory)
+            s3_logical_inventory = load_s3_logical_sbom_inventory(
+                args.s3_sbom_inventory
+            )
             LOGGER.info(
-                "loaded S3 SBOM inventory path=%s objects=%d",
+                "loaded S3 SBOM inventory path=%s objects=%d logical_sboms=%d",
                 args.s3_sbom_inventory,
                 len(s3_inventory),
+                len(s3_logical_inventory),
             )
     except SbomError as exc:
         if progress:
@@ -1200,6 +1256,48 @@ def main() -> None:
                 )
         return True
 
+    def skip_logical_inventory_artifact(path: Path, sbom_version: str) -> Path | None:
+        nonlocal s3_existing, inventory_existing
+        if not args.skip_existing_s3_sboms or s3_inventory is None:
+            return None
+        try:
+            relative_path = path.resolve().relative_to(args.out_dir.resolve()).as_posix()
+        except ValueError as exc:
+            raise S3PublishError(f"{path} is not under inventory root {args.out_dir}") from exc
+        if relative_path in s3_inventory:
+            existing_relative = relative_path
+        else:
+            artifact_dir = str(Path(relative_path).parent).replace("\\", "/")
+            existing_relative = s3_logical_inventory.get((artifact_dir, sbom_version))
+        if not existing_relative:
+            return None
+        existing_path = args.out_dir / existing_relative
+        LOGGER.info(
+            "skipping local SBOM generation for inventory-present logical artifact "
+            "path=%s existing_path=%s sbom_version=%s",
+            path,
+            existing_path,
+            sbom_version,
+        )
+        summary = inventory_upload_summary(
+            [existing_path],
+            root=args.out_dir,
+            s3_uri=args.s3_uri,
+        )
+        with publish_lock:
+            s3_existing += summary.existing
+            inventory_existing += summary.existing
+            if progress:
+                progress.update(
+                    counts={
+                        "s3_uploaded": s3_uploaded,
+                        "s3_existing": s3_existing,
+                        "s3_inventory_existing": inventory_existing,
+                        "local_artifacts_cleaned": cleaned,
+                    }
+                )
+        return existing_path
+
     try:
         entries = load_mapping_entries(args.mapping_json)
         LOGGER.info(
@@ -1226,6 +1324,7 @@ def main() -> None:
             artifact_subdirs=args.artifact_subdirs,
             artifact_selection=args.artifact_selection,
             skip_artifacts=skip_inventory_artifacts,
+            skip_logical_artifact=skip_logical_inventory_artifact,
         )
     except (SbomError, S3PublishError, AdvisoryIndexError) as exc:
         if progress:

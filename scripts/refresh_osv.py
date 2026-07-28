@@ -20,12 +20,12 @@ from scripts.correlate_osv import (
     DEFAULT_OSV_BATCH_SIZE,
     DEFAULT_OSV_BATCH_URL,
     OsvError,
+    SecurityArtifactResult,
     _load_json_path,
     correlate_sbom_with_results,
     extract_component_purls,
     query_osv_chunked,
-    versioned_output_path,
-    write_advisory,
+    write_advisory_artifacts,
 )
 from scripts.generate_sbom import DEFAULT_LOCAL_CHANNEL, read_security_sbom_payload
 from scripts.load_progress import ProgressTracker
@@ -61,8 +61,7 @@ class RefreshResult:
 @dataclass(frozen=True)
 class AdvisoryArtifact:
     index: int
-    path: Path
-    created: bool
+    results: list[SecurityArtifactResult]
 
 
 OutputHandler = Callable[[Path], None]
@@ -281,32 +280,36 @@ def refresh_osv(
             osv_results=osv_results,
             api_url=api_url,
         )
-        out = versioned_output_path(sbom_path, advisory)
         if dry_run:
-            created = not out.exists()
-            LOGGER.info(
-                "dry-run OSV advisory path=%s would_create=%s",
-                out,
-                created,
+            results = write_advisory_artifacts(
+                advisory,
+                sbom_path=sbom_path,
+                dry_run=True,
             )
-            if on_output:
-                on_output(out)
-            return AdvisoryArtifact(index=index, path=out, created=created)
-        out, created = write_advisory(advisory, out)
+            LOGGER.info(
+                "dry-run OSV advisory artifacts paths=%s",
+                [str(result.path) for result in results],
+            )
+            for result in results:
+                if on_output:
+                    on_output(result.path)
+            return AdvisoryArtifact(index=index, results=results)
+        results = write_advisory_artifacts(advisory, sbom_path=sbom_path)
         LOGGER.info(
-            "OSV advisory artifact complete path=%s created=%s",
-            out,
-            created,
+            "OSV advisory artifacts complete paths=%s",
+            [str(result.path) for result in results],
         )
-        if on_output:
-            on_output(out)
-        return AdvisoryArtifact(index=index, path=out, created=created)
+        for result in results:
+            if on_output:
+                on_output(result.path)
+        return AdvisoryArtifact(index=index, results=results)
 
     def record_result(result: AdvisoryArtifact) -> None:
         nonlocal written, existing
-        outputs.append(result.path)
-        written += 1 if result.created else 0
-        existing += 0 if result.created else 1
+        for artifact in result.results:
+            outputs.append(artifact.path)
+            written += 1 if artifact.created else 0
+            existing += 0 if artifact.created else 1
 
     def update_processed(count: int, path: Path) -> None:
         if progress:
@@ -561,7 +564,7 @@ def main() -> None:
 
     def publish_output(path: Path) -> None:
         nonlocal s3_uploaded, s3_existing, cleaned, inventory_existing
-        if index_state and path.exists():
+        if index_state and path.exists() and path.parent.name.endswith(".advisories"):
             with publish_lock:
                 LOGGER.info("updating advisory index from OSV artifact path=%s", path)
                 index_state.update_advisory(path)

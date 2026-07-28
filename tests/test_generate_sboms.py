@@ -10,6 +10,7 @@ from scripts.load_progress import ProgressTracker
 from scripts.generate_sboms import (
     generate_many,
     is_eligible_mapping,
+    load_s3_logical_sbom_inventory,
     load_s3_sbom_inventory,
     load_repodata,
     load_mapping_entries,
@@ -298,6 +299,44 @@ class GenerateSbomsTests(unittest.TestCase):
         self.assertEqual(len(skipped_paths), 1)
         self.assertFalse(any(path.exists() for path in skipped_paths))
 
+    def test_generate_many_can_skip_logical_inventory_present_sboms(self) -> None:
+        entries = [
+            (
+                "demo",
+                {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "build": "py_0",
+                    "subdir": "noarch",
+                    "purl": "pkg:pypi/demo-pkg",
+                    "pkg_name": "demo-pkg",
+                },
+            )
+        ]
+        skipped: list[tuple[Path, str]] = []
+
+        def skip_logical_artifact(path: Path, sbom_version: str) -> Path | None:
+            skipped.append((path, sbom_version))
+            return path.with_name(f"{'b' * 64}.conda")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "scripts.generate_sboms._load_json_ref", return_value=self._repodata()
+            ):
+                result = generate_many(
+                    entries,
+                    channel="conda-forge",
+                    out_dir=Path(tmp) / "local-advisory-channel",
+                    purl_type_filter="pypi",
+                    skip_logical_artifact=skip_logical_artifact,
+                )
+
+        self.assertEqual(result.generated, [])
+        self.assertEqual(result.existing, 0)
+        self.assertEqual(result.inventory_skipped, 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertRegex(skipped[0][1], r"^[0-9a-f]{64}$")
+
     def test_load_repodata_uses_fresh_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp) / "cache"
@@ -350,6 +389,34 @@ class GenerateSbomsTests(unittest.TestCase):
                     inventory=inventory,
                 )
             )
+
+    def test_load_s3_logical_sbom_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory_path = Path(tmp) / "inventory.json"
+            inventory_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 3,
+                        "objects": [],
+                        "logical_sboms": {
+                            "noarch/demo-1.2.3-py_0.sboms": {
+                                "abc": (
+                                    "noarch/demo-1.2.3-py_0.sboms/"
+                                    f"{'a' * 64}.conda"
+                                )
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+            inventory = load_s3_logical_sbom_inventory(inventory_path)
+
+        self.assertEqual(
+            inventory[("noarch/demo-1.2.3-py_0.sboms", "abc")],
+            f"noarch/demo-1.2.3-py_0.sboms/{'a' * 64}.conda",
+        )
 
 
 if __name__ == "__main__":

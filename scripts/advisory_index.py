@@ -20,6 +20,7 @@ from scripts.cli_logging import add_logging_args, configure_logging, print_log_l
 from scripts.generate_sbom import (
     DEFAULT_CHANNEL,
     DEFAULT_LOCAL_CHANNEL,
+    SECURITY_ADVISORIES_PAYLOAD_NAME,
     SECURITY_METADATA_NAME,
     SECURITY_SBOM_PAYLOAD_NAME,
 )
@@ -130,8 +131,22 @@ def _is_security_sbom_relative_path(path: str) -> bool:
     )
 
 
-def _load_security_sbom_artifact_bytes(
-    data: bytes, *, relative_path: str
+def _is_security_advisories_relative_path(path: str) -> bool:
+    parts = Path(path).parts
+    return (
+        len(parts) >= 3
+        and parts[-2].endswith(".advisories")
+        and _security_artifact_name_hash(Path(parts[-1])) is not None
+    )
+
+
+def _load_security_artifact_bytes(
+    data: bytes,
+    *,
+    relative_path: str,
+    expected_kind: str,
+    expected_schema: str,
+    payload_name: str,
 ) -> tuple[dict[str, Any], dict[str, Any], str, int]:
     path = Path(relative_path)
     actual_sha256 = _sha256_bytes(data)
@@ -144,44 +159,72 @@ def _load_security_sbom_artifact_bytes(
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             security = json.loads(archive.read(SECURITY_METADATA_NAME))
-            sbom_payload = archive.read(SECURITY_SBOM_PAYLOAD_NAME)
-            sbom = json.loads(sbom_payload)
+            payload_bytes = archive.read(payload_name)
+            payload = json.loads(payload_bytes)
     except (KeyError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
         raise AdvisoryIndexError(
-            f"{relative_path}: invalid SBOM security artifact: {exc}"
+            f"{relative_path}: invalid security artifact: {exc}"
         ) from exc
     if not isinstance(security, dict):
         raise AdvisoryIndexError(f"{relative_path}: info/security.json must be object")
-    if not isinstance(sbom, dict):
-        raise AdvisoryIndexError(f"{relative_path}: sbom.v1.json must be object")
+    if not isinstance(payload, dict):
+        raise AdvisoryIndexError(f"{relative_path}: {payload_name} must be object")
 
     metadata = security.get("metadata")
     if not isinstance(metadata, dict):
         raise AdvisoryIndexError(f"{relative_path}: security metadata is missing")
-    if metadata.get("kind") != "SBOM":
-        raise AdvisoryIndexError(f"{relative_path}: security kind must be SBOM")
-    if metadata.get("data_schema") != "sbom.v1":
-        raise AdvisoryIndexError(f"{relative_path}: data_schema must be sbom.v1")
+    if metadata.get("kind") != expected_kind:
+        raise AdvisoryIndexError(
+            f"{relative_path}: security kind must be {expected_kind}"
+        )
+    if metadata.get("data_schema") != expected_schema:
+        raise AdvisoryIndexError(
+            f"{relative_path}: data_schema must be {expected_schema}"
+        )
 
     artifacts = security.get("artifacts")
     sbom_artifact = (
-        artifacts.get(SECURITY_SBOM_PAYLOAD_NAME)
+        artifacts.get(payload_name)
         if isinstance(artifacts, dict)
         else None
     )
     if not isinstance(sbom_artifact, dict):
         raise AdvisoryIndexError(
-            f"{relative_path}: missing artifact metadata for {SECURITY_SBOM_PAYLOAD_NAME}"
+            f"{relative_path}: missing artifact metadata for {payload_name}"
         )
     expected_payload_sha256 = sbom_artifact.get("sha256")
-    if expected_payload_sha256 != _sha256_bytes(sbom_payload):
-        raise AdvisoryIndexError(f"{relative_path}: sbom.v1.json hash mismatch")
+    if expected_payload_sha256 != _sha256_bytes(payload_bytes):
+        raise AdvisoryIndexError(f"{relative_path}: {payload_name} hash mismatch")
     expected_payload_size = sbom_artifact.get("size")
     if isinstance(expected_payload_size, int) and expected_payload_size != len(
-        sbom_payload
+        payload_bytes
     ):
-        raise AdvisoryIndexError(f"{relative_path}: sbom.v1.json size mismatch")
-    return sbom, security, actual_sha256, len(data)
+        raise AdvisoryIndexError(f"{relative_path}: {payload_name} size mismatch")
+    return payload, security, actual_sha256, len(data)
+
+
+def _load_security_sbom_artifact_bytes(
+    data: bytes, *, relative_path: str
+) -> tuple[dict[str, Any], dict[str, Any], str, int]:
+    return _load_security_artifact_bytes(
+        data,
+        relative_path=relative_path,
+        expected_kind="SBOM",
+        expected_schema="sbom.v1",
+        payload_name=SECURITY_SBOM_PAYLOAD_NAME,
+    )
+
+
+def _load_security_advisories_artifact_bytes(
+    data: bytes, *, relative_path: str
+) -> tuple[dict[str, Any], dict[str, Any], str, int]:
+    return _load_security_artifact_bytes(
+        data,
+        relative_path=relative_path,
+        expected_kind="ADVISORIES",
+        expected_schema="advisories.v1",
+        payload_name=SECURITY_ADVISORIES_PAYLOAD_NAME,
+    )
 
 
 def _load_security_sbom_artifact_path(
@@ -195,6 +238,17 @@ def _load_security_sbom_artifact_path(
     return _load_security_sbom_artifact_bytes(data, relative_path=relative_path)
 
 
+def _load_security_advisories_artifact_path(
+    path: Path, *, channel_root: Path
+) -> tuple[dict[str, Any], dict[str, Any], str, int]:
+    relative_path = _relative(path, channel_root)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise AdvisoryIndexError(f"{path}: file does not exist") from exc
+    return _load_security_advisories_artifact_bytes(data, relative_path=relative_path)
+
+
 def _subject(sbom: dict[str, Any]) -> dict[str, Any]:
     metadata = sbom.get("metadata")
     component = metadata.get("component") if isinstance(metadata, dict) else None
@@ -205,8 +259,11 @@ def _subject(sbom: dict[str, Any]) -> dict[str, Any]:
 
 def _artifact_filename(path: Path) -> str:
     parts = path.parts
-    if len(parts) >= 3 and parts[-2].endswith(".sboms"):
-        return f"{parts[-2].removesuffix('.sboms')}.conda"
+    if len(parts) >= 3 and parts[-2].endswith((".sboms", ".advisories")):
+        suffix = ".sboms" if parts[-2].endswith(".sboms") else ".advisories"
+        return f"{parts[-2].removesuffix(suffix)}.conda"
+    if len(parts) >= 4 and parts[-3].endswith(".matches"):
+        return f"{parts[-3].removesuffix('.matches')}.conda"
     if path.parent.parent.name in {"sboms", "advisories"}:
         return path.parent.name
     return path.name.removesuffix(".cdx.json").removesuffix(".osv.json")
@@ -214,8 +271,10 @@ def _artifact_filename(path: Path) -> str:
 
 def _artifact_subdir(path: Path) -> str:
     parts = path.parts
-    if len(parts) >= 3 and parts[-2].endswith(".sboms"):
+    if len(parts) >= 3 and parts[-2].endswith((".sboms", ".advisories")):
         return parts[-3]
+    if len(parts) >= 4 and parts[-3].endswith(".matches"):
+        return parts[-4]
     if path.parent.parent.name in {"sboms", "advisories"}:
         return path.parent.parent.parent.name
     return path.parent.parent.name
@@ -301,6 +360,12 @@ def _sbom_version_from_record(record: dict[str, Any]) -> str | None:
         if isinstance(value, str):
             return value
     return None
+
+
+def _same_source_sbom(*, sbom_current: Any, source_sbom: Any) -> bool:
+    if not isinstance(sbom_current, str) or not isinstance(source_sbom, str):
+        return False
+    return source_sbom == sbom_current or source_sbom.endswith(f"/{sbom_current}")
 
 
 def sbom_index_update_from_data(
@@ -397,6 +462,7 @@ def advisory_index_update_from_data(
     )
     osv = {
         "current": relative_path,
+        "source_sbom": advisory.get("source_sbom"),
         "correlation_version": advisory.get("correlation_version"),
         "query_count": advisory.get("query_count", 0),
         "vulnerability_count": advisory.get("vulnerability_count", 0),
@@ -421,9 +487,18 @@ def advisory_index_update_from_data(
 def advisory_index_update(
     advisory_path: Path, *, channel_root: Path
 ) -> tuple[str, str, dict]:
+    relative_path = _relative(advisory_path, channel_root)
+    if _is_security_advisories_relative_path(relative_path):
+        advisory, _security, _artifact_sha256, _artifact_size = (
+            _load_security_advisories_artifact_path(
+                advisory_path,
+                channel_root=channel_root,
+            )
+        )
+        return advisory_index_update_from_data(advisory, relative_path=relative_path)
     return advisory_index_update_from_data(
         _load_json_path(advisory_path),
-        relative_path=_relative(advisory_path, channel_root),
+        relative_path=relative_path,
     )
 
 
@@ -435,9 +510,10 @@ def iter_sbom_paths(channel_root: Path) -> list[Path]:
 
 
 def iter_advisory_paths(channel_root: Path) -> list[Path]:
+    security = channel_root.glob("*/*.advisories/*.conda")
     versioned = channel_root.glob("*/advisories/*/osv-*.json")
     legacy = channel_root.glob("*/advisories/*.osv*.json")
-    return sorted([*versioned, *legacy])
+    return sorted([*security, *versioned, *legacy])
 
 
 def _shard_name(*, filename: str, record: dict[str, Any]) -> str:
@@ -624,9 +700,14 @@ class AdvisoryIndexState:
             record["sboms"] = merged_sboms
         osv = record.get("osv")
         sbom_version = _sbom_version_from_record(record)
+        sbom_current = (_current_sbom_record(record) or {}).get("current")
         osv_current = osv.get("current") if isinstance(osv, dict) else None
+        source_sbom = osv.get("source_sbom") if isinstance(osv, dict) else None
         if isinstance(osv_current, str) and isinstance(sbom_version, str):
-            if sbom_version not in Path(osv_current).name:
+            if sbom_version not in Path(osv_current).name and not _same_source_sbom(
+                sbom_current=sbom_current,
+                source_sbom=source_sbom,
+            ):
                 record.pop("osv", None)
         packages[filename] = record
 
@@ -652,12 +733,19 @@ class AdvisoryIndexState:
             packages.get(filename) if isinstance(packages.get(filename), dict) else {}
         )
         sbom_version = _sbom_version_from_record(existing)
+        sbom_current = (_current_sbom_record(existing) or {}).get("current")
         update_osv = update.get("osv")
         update_osv_current = (
             update_osv.get("current") if isinstance(update_osv, dict) else None
         )
+        update_source_sbom = (
+            update_osv.get("source_sbom") if isinstance(update_osv, dict) else None
+        )
         if isinstance(sbom_version, str) and isinstance(update_osv_current, str):
-            if sbom_version not in Path(update_osv_current).name:
+            if sbom_version not in Path(update_osv_current).name and not _same_source_sbom(
+                sbom_current=sbom_current,
+                source_sbom=update_source_sbom,
+            ):
                 return
         existing_osv = existing.get("osv") if isinstance(existing, dict) else None
         if not _replace_current_reference(
@@ -921,6 +1009,41 @@ def read_s3_sbom(
     )
 
 
+def read_s3_advisory(
+    *,
+    relative_path: str,
+    s3_uri: str,
+    profile: str | None = None,
+    region: str | None = None,
+    runner: Runner = subprocess.run,
+) -> tuple[str, dict[str, Any]]:
+    if _is_security_advisories_relative_path(relative_path):
+        data = read_s3_bytes(
+            relative_path=relative_path,
+            s3_uri=s3_uri,
+            profile=profile,
+            region=region,
+            runner=runner,
+        )
+        advisory, _security, _artifact_sha256, _artifact_size = (
+            _load_security_advisories_artifact_bytes(
+                data,
+                relative_path=relative_path,
+            )
+        )
+        return relative_path, advisory
+    return (
+        relative_path,
+        read_s3_json(
+            relative_path=relative_path,
+            s3_uri=s3_uri,
+            profile=profile,
+            region=region,
+            runner=runner,
+        ),
+    )
+
+
 def read_s3_json_many(
     *,
     relative_paths: list[str],
@@ -963,6 +1086,48 @@ def read_s3_json_many(
         for future in as_completed(futures):
             index = futures[future]
             results[index] = (relative_paths[index], future.result())
+    return [result for result in results if result is not None]
+
+
+def read_s3_advisory_many(
+    *,
+    relative_paths: list[str],
+    s3_uri: str,
+    profile: str | None = None,
+    region: str | None = None,
+    workers: int = DEFAULT_WORKERS,
+    runner: Runner = subprocess.run,
+) -> list[tuple[str, dict[str, Any]]]:
+    if workers < 1:
+        raise AdvisoryIndexError("--workers must be at least 1")
+    if workers == 1 or len(relative_paths) <= 1:
+        return [
+            read_s3_advisory(
+                relative_path=path,
+                s3_uri=s3_uri,
+                profile=profile,
+                region=region,
+                runner=runner,
+            )
+            for path in relative_paths
+        ]
+
+    results: list[tuple[str, dict[str, Any]] | None] = [None] * len(relative_paths)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                read_s3_advisory,
+                relative_path=path,
+                s3_uri=s3_uri,
+                profile=profile,
+                region=region,
+                runner=runner,
+            ): index
+            for index, path in enumerate(relative_paths)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            results[index] = future.result()
     return [result for result in results if result is not None]
 
 
@@ -1057,7 +1222,7 @@ def build_indexes_from_s3(
                 relative_path=relative_path,
             )
             state.update_sbom_record(subdir=subdir, filename=filename, update=update)
-    for relative_path, advisory in read_s3_json_many(
+    for relative_path, advisory in read_s3_advisory_many(
         relative_paths=advisory_paths,
         s3_uri=s3_uri,
         profile=profile,

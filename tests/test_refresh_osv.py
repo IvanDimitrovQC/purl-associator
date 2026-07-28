@@ -92,11 +92,16 @@ class RefreshOsvTests(unittest.TestCase):
 
         self.assertEqual(first.scanned, 1)
         self.assertEqual(first.queried_purls, 1)
-        self.assertEqual(first.written, 1)
+        self.assertEqual(first.written, 3)
         self.assertEqual(first.existing, 0)
         self.assertEqual(second.written, 0)
-        self.assertEqual(second.existing, 1)
-        self.assertTrue(first.outputs[0].name.startswith("osv-abc123def456-"))
+        self.assertEqual(second.existing, 3)
+        self.assertEqual(
+            sorted(path.parent.name for path in first.outputs),
+            ["GHSA-demo-0001", "GHSA-demo-0001", "demo-1.2.3-py_0.advisories"],
+        )
+        self.assertEqual(first.outputs[-1].parent.name, "demo-1.2.3-py_0.advisories")
+        self.assertRegex(first.outputs[-1].name, r"^[0-9a-f]{64}\.conda$")
         self.assertEqual(published, first.outputs)
         self.assertEqual(progress_data["counts"]["processed"], 1)
 
@@ -126,9 +131,19 @@ class RefreshOsvTests(unittest.TestCase):
 
         self.assertEqual(result.scanned, 1)
         self.assertEqual(result.queried_purls, 1)
-        self.assertEqual(result.written, 1)
-        self.assertEqual(result.outputs[0].parent.name, "demo-1.2.3-py_0.conda")
-        self.assertTrue(result.outputs[0].name.startswith(f"osv-{artifact_sha256}-"))
+        self.assertEqual(result.written, 3)
+        self.assertIn(
+            root / "cves" / "GHSA-demo-0001",
+            {path.parent for path in result.outputs},
+        )
+        self.assertIn(
+            root / "noarch" / "demo-1.2.3-py_0.matches" / "GHSA-demo-0001",
+            {path.parent for path in result.outputs},
+        )
+        self.assertIn(
+            root / "noarch" / "demo-1.2.3-py_0.advisories",
+            {path.parent for path in result.outputs},
+        )
 
     def test_s3_osv_inventory_matches_channel_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

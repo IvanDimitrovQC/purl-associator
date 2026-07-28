@@ -12,6 +12,7 @@ from scripts.generate_sbom import (
     SECURITY_SBOM_PAYLOAD_NAME,
     add_version_to_purl,
     build_cyclonedx_sbom,
+    build_security_sbom_artifact_bytes,
     generate_sbom,
     generate_sbom_from_mapping,
     get_sbom_version,
@@ -74,6 +75,7 @@ class GenerateSbomTests(unittest.TestCase):
                     "version": "1.2.3",
                     "build": "py_0",
                     "build_number": 0,
+                    "timestamp": 1720000000000,
                     "depends": ["python >=3.12"],
                     "license": "MIT",
                     "sha256": "a" * 64,
@@ -131,6 +133,7 @@ class GenerateSbomTests(unittest.TestCase):
             sbom["dependencies"][0]["dependsOn"],
             ["pkg:pypi/demo-pkg@1.2.3"],
         )
+        self.assertEqual(sbom["metadata"]["timestamp"], "2024-07-03T09:46:40+00:00")
         self.assertRegex(get_sbom_version(sbom), r"^[0-9a-f]{64}$")
 
     def test_generate_sbom_from_mapping_entry(self) -> None:
@@ -282,6 +285,78 @@ class GenerateSbomTests(unittest.TestCase):
 
         self.assertEqual(get_sbom_version(first), get_sbom_version(second))
         self.assertNotEqual(get_sbom_version(first), get_sbom_version(third))
+
+    def test_security_sbom_artifact_hash_is_stable_for_same_content(self) -> None:
+        record = {
+            "name": "demo",
+            "version": "1.2.3",
+            "build": "py_0",
+            "build_number": 0,
+            "sha256": "a" * 64,
+            "timestamp": 1720000000000,
+        }
+        mapping = {
+            "name": "demo",
+            "version": "1.2.3",
+            "build": "py_0",
+            "subdir": "noarch",
+            "purl": "pkg:pypi/demo-pkg",
+            "pkg_name": "demo-pkg",
+        }
+
+        first = build_cyclonedx_sbom(
+            mapping=mapping,
+            record=record,
+            filename="demo-1.2.3-py_0.conda",
+            channel="conda-forge",
+            subdir="noarch",
+        )
+        second = build_cyclonedx_sbom(
+            mapping=mapping,
+            record=record,
+            filename="demo-1.2.3-py_0.conda",
+            channel="conda-forge",
+            subdir="noarch",
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            build_security_sbom_artifact_bytes(sbom=first),
+            build_security_sbom_artifact_bytes(sbom=second),
+        )
+
+    def test_security_sbom_artifact_hash_has_stable_missing_timestamp_fallback(
+        self,
+    ) -> None:
+        record = {
+            "name": "demo",
+            "version": "1.2.3",
+            "build": "py_0",
+            "build_number": 0,
+            "sha256": "a" * 64,
+        }
+        mapping = {
+            "name": "demo",
+            "version": "1.2.3",
+            "build": "py_0",
+            "subdir": "noarch",
+            "purl": "pkg:pypi/demo-pkg",
+            "pkg_name": "demo-pkg",
+        }
+
+        sbom = build_cyclonedx_sbom(
+            mapping=mapping,
+            record=record,
+            filename="demo-1.2.3-py_0.conda",
+            channel="conda-forge",
+            subdir="noarch",
+        )
+
+        self.assertEqual(sbom["metadata"]["timestamp"], "1980-01-01T00:00:00+00:00")
+        self.assertEqual(
+            build_security_sbom_artifact_bytes(sbom=sbom),
+            build_security_sbom_artifact_bytes(sbom=sbom),
+        )
 
     def test_add_version_to_purl_preserves_qualifiers_and_subpath(self) -> None:
         self.assertEqual(

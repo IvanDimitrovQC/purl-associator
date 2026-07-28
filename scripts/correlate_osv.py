@@ -15,6 +15,7 @@ import json
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,13 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
-from scripts.generate_sbom import read_security_sbom_payload
+from scripts.generate_sbom import (
+    SECURITY_ADVISORIES_PAYLOAD_NAME,
+    SECURITY_CVE_PAYLOAD_NAME,
+    SECURITY_MATCH_PAYLOAD_NAME,
+    build_security_artifact_bytes,
+    read_security_sbom_payload,
+)
 from scripts.s3_publish import (
     S3PublishError,
     add_s3_args,
@@ -39,12 +46,23 @@ DEFAULT_OSV_DETAIL_WORKERS = 8
 DEFAULT_OSV_RETRIES = 3
 DEFAULT_OSV_RETRY_DELAY_SECONDS = 1.0
 OSV_ADVISORY_SCHEMA_VERSION = 2
+SECURITY_CVE_SCHEMA = "cve.v1"
+SECURITY_MATCH_SCHEMA = "match.v1"
+SECURITY_ADVISORIES_SCHEMA = "advisories.v1"
 OSV_VULNERABILITY_URL_BASE = "https://osv.dev/vulnerability"
 LOGGER = logging.getLogger("scripts.correlate_osv")
 
 
 class OsvError(RuntimeError):
     """User-facing OSV correlation failure."""
+
+
+@dataclass(frozen=True)
+class SecurityArtifactResult:
+    path: Path
+    created: bool
+    kind: str
+    size: int
 
 
 def _load_json_path(path: Path) -> dict[str, Any]:
@@ -79,6 +97,22 @@ def _canonical_json(data: Any) -> str:
 
 def _sha256(data: Any) -> str:
     return hashlib.sha256(_canonical_json(data).encode()).hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _created_on(timestamp: str | None = None) -> int:
+    if timestamp:
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return int(parsed.timestamp())
+        except ValueError:
+            pass
+    return int(datetime.now(UTC).timestamp())
 
 
 def _has_version(purl: str) -> bool:
@@ -659,6 +693,360 @@ def finalized_advisory(advisory: dict[str, Any]) -> dict[str, Any]:
     return finalized
 
 
+def _artifact_filename_from_sbom_path(sbom_path: Path) -> str:
+    if sbom_path.name.endswith(".conda") and sbom_path.parent.name.endswith(".sboms"):
+        return f"{sbom_path.parent.name.removesuffix('.sboms')}.conda"
+    if (
+        sbom_path.name.startswith("sbom-")
+        and sbom_path.name.endswith(".cdx.json")
+        and sbom_path.parent.parent.name == "sboms"
+    ):
+        return sbom_path.parent.name
+    if sbom_path.parent.name == "sboms":
+        return sbom_path.name.removesuffix(".cdx.json")
+    return sbom_path.name
+
+
+def _artifact_stem(filename: str) -> str:
+    if filename.endswith(".tar.bz2"):
+        return filename.removesuffix(".tar.bz2")
+    if filename.endswith(".conda"):
+        return filename.removesuffix(".conda")
+    return Path(filename).stem
+
+
+def _channel_root_from_sbom_path(sbom_path: Path) -> Path:
+    if sbom_path.name.endswith(".conda") and sbom_path.parent.name.endswith(".sboms"):
+        return sbom_path.parent.parent.parent
+    if (
+        sbom_path.name.startswith("sbom-")
+        and sbom_path.name.endswith(".cdx.json")
+        and sbom_path.parent.parent.name == "sboms"
+    ):
+        return sbom_path.parent.parent.parent.parent
+    if sbom_path.parent.name == "sboms":
+        return sbom_path.parent.parent.parent
+    return sbom_path.parent
+
+
+def _subdir_from_sbom_path(sbom_path: Path) -> str:
+    if sbom_path.name.endswith(".conda") and sbom_path.parent.name.endswith(".sboms"):
+        return sbom_path.parent.parent.name
+    if (
+        sbom_path.name.startswith("sbom-")
+        and sbom_path.name.endswith(".cdx.json")
+        and sbom_path.parent.parent.name == "sboms"
+    ):
+        return sbom_path.parent.parent.parent.name
+    if sbom_path.parent.name == "sboms":
+        return sbom_path.parent.parent.name
+    return sbom_path.parent.name
+
+
+def _relative(path: Path, root: Path) -> str:
+    return path.resolve().relative_to(root.resolve()).as_posix()
+
+
+def _safe_vulnerability_id(value: str) -> str:
+    return quote(value, safe="-._~")
+
+
+def _security_artifact_ref(
+    path: Path, *, root: Path, size: int | None = None
+) -> dict[str, Any]:
+    return {
+        "path": _relative(path, root),
+        "sha256": path.name.removesuffix(".conda"),
+        "size": path.stat().st_size if size is None else size,
+    }
+
+
+def _write_security_payload(
+    *,
+    payload: dict[str, Any],
+    out_dir: Path,
+    kind: str,
+    data_schema: str,
+    payload_name: str,
+    created_on: int,
+    dry_run: bool = False,
+) -> SecurityArtifactResult:
+    artifact_bytes = build_security_artifact_bytes(
+        payload=payload,
+        kind=kind,
+        data_schema=data_schema,
+        payload_name=payload_name,
+        created_on=created_on,
+    )
+    artifact_sha256 = _sha256_bytes(artifact_bytes)
+    path = out_dir / f"{artifact_sha256}.conda"
+    created = not path.exists()
+    if not dry_run and created:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_bytes(artifact_bytes)
+        tmp.replace(path)
+    LOGGER.info("wrote security artifact path=%s kind=%s created=%s", path, kind, created)
+    return SecurityArtifactResult(
+        path=path,
+        created=created,
+        kind=kind,
+        size=len(artifact_bytes),
+    )
+
+
+def _cve_payload(
+    *,
+    vulnerability: dict[str, Any],
+    api_url: str,
+) -> dict[str, Any]:
+    vuln_id = vulnerability.get("id")
+    if not isinstance(vuln_id, str) or not vuln_id:
+        raise OsvError("vulnerability is missing id")
+    return {
+        "schema_version": 1,
+        "id": vuln_id,
+        "url": osv_vulnerability_url(vuln_id),
+        "source": {
+            "name": "osv.dev",
+            "api": api_url,
+        },
+        "modified": vulnerability.get("modified"),
+        "osv": vulnerability,
+    }
+
+
+def _findings_by_vulnerability(advisory: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for finding in advisory.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        vuln_id = finding.get("vulnerability_id")
+        if isinstance(vuln_id, str) and vuln_id:
+            grouped.setdefault(vuln_id, []).append(finding)
+    return grouped
+
+
+def _vulnerabilities_by_id(advisory: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    vulnerabilities: dict[str, dict[str, Any]] = {}
+    for component in advisory.get("components") or []:
+        if not isinstance(component, dict):
+            continue
+        for vulnerability in component.get("vulnerabilities") or []:
+            if not isinstance(vulnerability, dict):
+                continue
+            vuln_id = vulnerability.get("id")
+            if isinstance(vuln_id, str) and vuln_id:
+                vulnerabilities.setdefault(vuln_id, vulnerability)
+    return vulnerabilities
+
+
+def _match_payload(
+    *,
+    advisory: dict[str, Any],
+    vulnerability_id: str,
+    cve_ref: dict[str, Any],
+    findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generated_at": advisory.get("generated_at"),
+        "source": advisory.get("source"),
+        "source_sbom": advisory.get("source_sbom"),
+        "subject": advisory.get("subject"),
+        "correlation_version": advisory.get("correlation_version"),
+        "vulnerability_id": vulnerability_id,
+        "cve": {
+            "id": vulnerability_id,
+            **cve_ref,
+        },
+        "findings": findings,
+    }
+
+
+def _advisory_rollup_payload(
+    *,
+    advisory: dict[str, Any],
+    cves: list[dict[str, Any]],
+    matches: list[dict[str, Any]],
+    vex: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generated_at": advisory.get("generated_at"),
+        "correlation_version": advisory.get("correlation_version"),
+        "source": advisory.get("source"),
+        "source_sbom": advisory.get("source_sbom"),
+        "subject": advisory.get("subject"),
+        "query_count": advisory.get("query_count", 0),
+        "vulnerability_count": advisory.get("vulnerability_count", 0),
+        "cves": cves,
+        "matches": matches,
+        "vex": vex,
+        "components": advisory.get("components") or [],
+        "skipped_components": advisory.get("skipped_components") or [],
+        "findings": advisory.get("findings") or [],
+    }
+
+
+def collect_vex_for_artifact(
+    *,
+    channel_root: Path,
+    subdir: str,
+    artifact_filename: str,
+    vulnerability_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not vulnerability_ids:
+        return []
+    vex_dir = channel_root / subdir / "vex" / artifact_filename
+    if not vex_dir.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(vex_dir.glob("vex-*.json")):
+        try:
+            with path.open() as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("ignoring unreadable VEX artifact path=%s", path)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        metadata = payload.get("metadata")
+        vulnerability = (
+            metadata.get("vulnerability") if isinstance(metadata, dict) else None
+        )
+        if vulnerability not in vulnerability_ids:
+            continue
+        out.append(
+            {
+                "path": _relative(path, channel_root),
+                "sha256": _sha256_bytes(path.read_bytes()),
+                "vulnerability_id": vulnerability,
+                "timestamp": payload.get("timestamp"),
+                "payload": payload,
+            }
+        )
+    return out
+
+
+def security_advisory_output_dir(sbom_path: Path) -> Path:
+    channel_root = _channel_root_from_sbom_path(sbom_path)
+    subdir = _subdir_from_sbom_path(sbom_path)
+    artifact_filename = _artifact_filename_from_sbom_path(sbom_path)
+    return channel_root / subdir / f"{_artifact_stem(artifact_filename)}.advisories"
+
+
+def write_advisory_artifacts(
+    advisory: dict[str, Any],
+    *,
+    sbom_path: Path,
+    vex: list[dict[str, Any]] | None = None,
+    dry_run: bool = False,
+) -> list[SecurityArtifactResult]:
+    finalized = finalized_advisory(advisory)
+    channel_root = _channel_root_from_sbom_path(sbom_path)
+    subdir = _subdir_from_sbom_path(sbom_path)
+    artifact_filename = _artifact_filename_from_sbom_path(sbom_path)
+    artifact_stem = _artifact_stem(artifact_filename)
+    generated_at = finalized.get("generated_at")
+    created_on = _created_on(generated_at if isinstance(generated_at, str) else None)
+    api_url = finalized.get("source", {}).get("api")
+    api_url = api_url if isinstance(api_url, str) else DEFAULT_OSV_BATCH_URL
+
+    outputs: list[SecurityArtifactResult] = []
+    cve_refs_by_id: dict[str, dict[str, Any]] = {}
+    vulnerabilities = _vulnerabilities_by_id(finalized)
+    findings = _findings_by_vulnerability(finalized)
+    for vuln_id, vulnerability in sorted(vulnerabilities.items()):
+        cve_payload = _cve_payload(vulnerability=vulnerability, api_url=api_url)
+        cve_created_on = _created_on(
+            vulnerability.get("modified")
+            if isinstance(vulnerability.get("modified"), str)
+            else None
+        )
+        cve_result = _write_security_payload(
+            payload=cve_payload,
+            out_dir=channel_root / "cves" / _safe_vulnerability_id(vuln_id),
+            kind="CVE",
+            data_schema=SECURITY_CVE_SCHEMA,
+            payload_name=SECURITY_CVE_PAYLOAD_NAME,
+            created_on=cve_created_on,
+            dry_run=dry_run,
+        )
+        outputs.append(cve_result)
+        cve_refs_by_id[vuln_id] = _security_artifact_ref(
+            cve_result.path,
+            root=channel_root,
+            size=cve_result.size,
+        )
+
+    match_refs: list[dict[str, Any]] = []
+    for vuln_id, cve_ref in sorted(cve_refs_by_id.items()):
+        match_payload = _match_payload(
+            advisory=finalized,
+            vulnerability_id=vuln_id,
+            cve_ref=cve_ref,
+            findings=findings.get(vuln_id, []),
+        )
+        match_result = _write_security_payload(
+            payload=match_payload,
+            out_dir=(
+                channel_root
+                / subdir
+                / f"{artifact_stem}.matches"
+                / _safe_vulnerability_id(vuln_id)
+            ),
+            kind="MATCH",
+            data_schema=SECURITY_MATCH_SCHEMA,
+            payload_name=SECURITY_MATCH_PAYLOAD_NAME,
+            created_on=created_on,
+            dry_run=dry_run,
+        )
+        outputs.append(match_result)
+        match_ref = _security_artifact_ref(
+            match_result.path,
+            root=channel_root,
+            size=match_result.size,
+        )
+        match_refs.append(
+            {
+                "id": vuln_id,
+                **match_ref,
+            }
+        )
+
+    cve_refs = [
+        {"id": vuln_id, **ref} for vuln_id, ref in sorted(cve_refs_by_id.items())
+    ]
+    vex_entries = (
+        vex
+        if vex is not None
+        else collect_vex_for_artifact(
+            channel_root=channel_root,
+            subdir=subdir,
+            artifact_filename=artifact_filename,
+            vulnerability_ids=set(cve_refs_by_id),
+        )
+    )
+    rollup = _advisory_rollup_payload(
+        advisory=finalized,
+        cves=cve_refs,
+        matches=match_refs,
+        vex=vex_entries,
+    )
+    rollup_result = _write_security_payload(
+        payload=rollup,
+        out_dir=channel_root / subdir / f"{artifact_stem}.advisories",
+        kind="ADVISORIES",
+        data_schema=SECURITY_ADVISORIES_SCHEMA,
+        payload_name=SECURITY_ADVISORIES_PAYLOAD_NAME,
+        created_on=created_on,
+        dry_run=dry_run,
+    )
+    outputs.append(rollup_result)
+    return outputs
+
+
 def default_output_path(sbom_path: Path) -> Path:
     if sbom_path.name.endswith(".conda") and sbom_path.parent.name.endswith(".sboms"):
         sbom_version = sbom_path.name.removesuffix(".conda")
@@ -726,6 +1114,10 @@ def write_advisory(advisory: dict[str, Any], out: Path) -> tuple[Path, bool]:
 
 
 def advisory_channel_root(advisory_path: Path) -> Path:
+    if advisory_path.name.endswith(".conda") and advisory_path.parent.name.endswith(
+        ".advisories"
+    ):
+        return advisory_path.parent.parent.parent
     if advisory_path.parent.parent.name == "advisories":
         return advisory_path.parent.parent.parent.parent
     if advisory_path.parent.name == "advisories":
@@ -773,19 +1165,21 @@ def main() -> None:
             LOGGER.info("writing explicit OSV advisory path=%s", out)
             out.write_text(json.dumps(finalized_advisory(advisory), indent=2) + "\n")
             status = "wrote explicit OSV advisory"
+            outputs = [out]
         else:
-            out, created = write_advisory(
-                advisory, versioned_output_path(args.sbom, advisory)
-            )
+            results = write_advisory_artifacts(advisory, sbom_path=args.sbom)
+            outputs = [result.path for result in results]
+            out = outputs[-1]
+            created = any(result.created for result in results)
             status = (
-                "generated new OSV advisory"
+                "generated new OSV advisory artifacts"
                 if created
-                else "OSV advisory version already exists"
+                else "OSV advisory artifacts already exist"
             )
         if args.s3_uri:
-            LOGGER.info("publishing OSV advisory to S3 path=%s", out)
+            LOGGER.info("publishing OSV advisory artifacts to S3 count=%d", len(outputs))
             summary = upload_files(
-                local_paths=[out],
+                local_paths=outputs,
                 root=advisory_channel_root(out),
                 s3_uri=args.s3_uri,
                 profile=args.s3_profile,
@@ -807,7 +1201,8 @@ def main() -> None:
     LOGGER.info("completed OSV correlation status=%s output=%s", status, out)
     print(status, file=sys.stderr)
     print_log_location(log_path)
-    print(out)
+    for path in outputs:
+        print(path)
 
 
 if __name__ == "__main__":
