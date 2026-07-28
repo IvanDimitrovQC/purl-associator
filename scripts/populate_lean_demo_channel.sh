@@ -112,7 +112,6 @@ run pixi run -e lite sbom:generate-many \
   --s3-sbom-inventory="$SBOM_INVENTORY" \
   --skip-existing-s3-sboms \
   --progress-file="$SBOM_PROGRESS" \
-  --update-index \
   "${CLEANUP_ARGS[@]}" \
   --workers="$WORKERS" \
   --s3-workers="$S3_WORKERS"
