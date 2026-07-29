@@ -7,7 +7,7 @@ cd "$ROOT"
 # Required AWS/channel defaults. Override any of these before invoking the script.
 export BUCKET="${BUCKET:-advisory-channel-457644036667-eu-north-1-an}"
 export REGION="${REGION:-eu-north-1}"
-export TOP_N="${TOP_N:-1000}"
+export TOP_N="${TOP_N:-100}"
 export PREFIX="${PREFIX:-test-top${TOP_N}}"
 export TEMP_PREFIX="${TEMP_PREFIX:-temp}"
 export CHANNEL="${CHANNEL:-s3://${BUCKET}/${PREFIX}}"
