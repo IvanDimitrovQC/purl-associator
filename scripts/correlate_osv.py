@@ -30,6 +30,7 @@ from scripts.generate_sbom import (
     SECURITY_MATCH_PAYLOAD_NAME,
     build_security_artifact_bytes,
     read_security_sbom_payload,
+    write_content_addressed_bytes,
 )
 from scripts.s3_publish import (
     S3PublishError,
@@ -780,12 +781,11 @@ def _write_security_payload(
     )
     artifact_sha256 = _sha256_bytes(artifact_bytes)
     path = out_dir / f"{artifact_sha256}.conda"
-    created = not path.exists()
-    if not dry_run and created:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_bytes(artifact_bytes)
-        tmp.replace(path)
+    path, created = write_content_addressed_bytes(
+        out=path,
+        data=artifact_bytes,
+        dry_run=dry_run,
+    )
     LOGGER.info("wrote security artifact path=%s kind=%s created=%s", path, kind, created)
     return SecurityArtifactResult(
         path=path,

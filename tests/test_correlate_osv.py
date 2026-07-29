@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 import json
 import tempfile
@@ -384,6 +385,66 @@ class CorrelateOsvTests(unittest.TestCase):
             real_results = write_advisory_artifacts(advisory, sbom_path=sbom_path)
 
         self.assertEqual(dry_run_paths, [result.path for result in real_results])
+
+    def test_write_advisory_artifacts_handles_parallel_duplicate_writes(self) -> None:
+        advisory = {
+            "schema_version": 2,
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "source": {
+                "name": "osv.dev",
+                "api": "https://api.osv.dev/v1/querybatch",
+            },
+            "source_sbom": "noarch/demo-1.2.3-py_0.sboms/abc.conda",
+            "subject": {"name": "demo", "version": "1.2.3"},
+            "query_count": 1,
+            "vulnerability_count": 1,
+            "findings": [
+                {
+                    "component_purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "component_name": "demo-pkg",
+                    "component_version": "1.2.3",
+                    "vulnerability_id": "GHSA-demo-0001",
+                    "modified": "2026-01-01T00:00:00Z",
+                }
+            ],
+            "components": [
+                {
+                    "name": "demo-pkg",
+                    "version": "1.2.3",
+                    "purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "vulnerabilities": [
+                        {
+                            "id": "GHSA-demo-0001",
+                            "modified": "2026-01-01T00:00:00Z",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sbom_path = (
+                Path(tmp)
+                / "channel"
+                / "noarch"
+                / "demo-1.2.3-py_0.sboms"
+                / f"{'a' * 64}.conda"
+            )
+            sbom_path.parent.mkdir(parents=True)
+
+            def write_once() -> list:
+                return write_advisory_artifacts(advisory, sbom_path=sbom_path)
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                results = list(executor.map(lambda _index: write_once(), range(64)))
+
+            flattened = [result for batch in results for result in batch]
+            self.assertTrue(all(result.path.exists() for result in flattened))
+            self.assertEqual(
+                sorted({result.kind for result in flattened}),
+                ["ADVISORIES", "CVE", "MATCH"],
+            )
+            self.assertEqual(sum(1 for result in flattened if result.created), 3)
 
 
 if __name__ == "__main__":

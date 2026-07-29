@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import sys
 import uuid
 import zipfile
@@ -715,6 +716,31 @@ def read_security_sbom_payload(path: Path) -> dict[str, Any]:
     return read_security_artifact_payload(path, payload_name=SECURITY_SBOM_PAYLOAD_NAME)
 
 
+def write_content_addressed_bytes(
+    *, out: Path, data: bytes, dry_run: bool = False
+) -> tuple[Path, bool]:
+    if dry_run:
+        return out, not out.exists()
+    if out.exists():
+        return out, False
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(data)
+        try:
+            os.link(tmp, out)
+        except FileExistsError:
+            created = False
+        else:
+            created = True
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    return out, created
+
+
 def write_security_artifact(
     *,
     payload: dict[str, Any],
@@ -734,15 +760,7 @@ def write_security_artifact(
     )
     artifact_sha256 = _sha256_bytes(artifact_bytes)
     out = out_dir / f"{artifact_sha256}.conda"
-    if dry_run:
-        return out, not out.exists()
-    if out.exists():
-        return out, False
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(f".{out.name}.tmp")
-    tmp.write_bytes(artifact_bytes)
-    tmp.replace(out)
-    return out, True
+    return write_content_addressed_bytes(out=out, data=artifact_bytes, dry_run=dry_run)
 
 
 def find_existing_security_sbom_artifact(
@@ -854,11 +872,7 @@ def write_versioned_sbom(
         version,
         artifact_sha256,
     )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(f".{out.name}.tmp")
-    tmp.write_bytes(artifact_bytes)
-    tmp.replace(out)
-    return out, True
+    return write_content_addressed_bytes(out=out, data=artifact_bytes)
 
 
 def _default_repodata_url(channel: str, subdir: str) -> str:
