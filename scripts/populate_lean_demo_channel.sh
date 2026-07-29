@@ -12,6 +12,7 @@ export PREFIX="${PREFIX:-test-top${TOP_N}}"
 export TEMP_PREFIX="${TEMP_PREFIX:-temp}"
 export CHANNEL="${CHANNEL:-s3://${BUCKET}/${PREFIX}}"
 export TEMP="${TEMP:-s3://${BUCKET}/${TEMP_PREFIX}}"
+export DASHBOARD_S3_OUTPUT_URI="${DASHBOARD_S3_OUTPUT_URI:-$TEMP}"
 
 # Local inputs/outputs.
 export MAPPING_JSON="${MAPPING_JSON:-mappings/auto.json}"
@@ -65,6 +66,7 @@ run() {
 printf 'Lean demo channel configuration:\n'
 printf '  CHANNEL=%s\n' "$CHANNEL"
 printf '  TEMP=%s\n' "$TEMP"
+printf '  DASHBOARD_S3_OUTPUT_URI=%s\n' "$DASHBOARD_S3_OUTPUT_URI"
 printf '  REGION=%s\n' "$REGION"
 printf '  TOP_N=%s\n' "$TOP_N"
 printf '  VERSIONS_PER_PACKAGE=%s\n' "$VERSIONS_PER_PACKAGE"
@@ -162,10 +164,11 @@ run pixi run -e lite advisory:dashboard-data \
   --mapping-json="$TOP_MAPPINGS" \
   --skip-osv-summary \
   --out="$DASHBOARD_OUT" \
-  --s3-output-uri="$TEMP" \
+  --s3-output-uri="$DASHBOARD_S3_OUTPUT_URI" \
   --workers="$WORKERS"
 
 printf '\nLean demo channel population complete.\n'
 printf '  CHANNEL=%s\n' "$CHANNEL"
 printf '  TOP_MAPPINGS=%s\n' "$TOP_MAPPINGS"
 printf '  DASHBOARD_OUT=%s\n' "$DASHBOARD_OUT"
+printf '  DASHBOARD_S3_OUTPUT_URI=%s\n' "$DASHBOARD_S3_OUTPUT_URI"

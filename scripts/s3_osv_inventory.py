@@ -31,21 +31,34 @@ def is_osv_advisory_path(path: str) -> bool:
     )
 
 
+def is_cve_artifact_path(path: str) -> bool:
+    name = Path(path).name
+    parts = Path(path).parts
+    return (
+        len(parts) >= 3
+        and parts[0] == "cves"
+        and name.endswith(".conda")
+        and len(name.removesuffix(".conda")) == 64
+        and all(char in "0123456789abcdef" for char in name.removesuffix(".conda"))
+    )
+
+
+def is_match_artifact_path(path: str) -> bool:
+    name = Path(path).name
+    parts = Path(path).parts
+    return (
+        len(parts) >= 4
+        and parts[-3].endswith(".matches")
+        and name.endswith(".conda")
+        and len(name.removesuffix(".conda")) == 64
+        and all(char in "0123456789abcdef" for char in name.removesuffix(".conda"))
+    )
+
+
 def is_osv_related_artifact_path(path: str) -> bool:
     if is_osv_advisory_path(path):
         return True
-    name = Path(path).name
-    parts = Path(path).parts
-    if not (
-        name.endswith(".conda")
-        and len(name.removesuffix(".conda")) == 64
-        and all(char in "0123456789abcdef" for char in name.removesuffix(".conda"))
-    ):
-        return False
-    return (
-        (len(parts) >= 3 and parts[0] == "cves")
-        or (len(parts) >= 4 and parts[-3].endswith(".matches"))
-    )
+    return is_cve_artifact_path(path) or is_match_artifact_path(path)
 
 
 def filter_osv_inventory_paths(paths: list[str]) -> list[str]:
@@ -60,11 +73,15 @@ def filter_osv_related_inventory_paths(paths: list[str]) -> list[str]:
 
 def osv_inventory_payload(*, s3_uri: str, object_paths: list[str]) -> dict[str, Any]:
     advisory_count = sum(1 for path in object_paths if is_osv_advisory_path(path))
+    cve_count = sum(1 for path in object_paths if is_cve_artifact_path(path))
+    match_count = sum(1 for path in object_paths if is_match_artifact_path(path))
     return {
         "schema_version": 2,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "s3_uri": s3_uri,
         "object_count": len(object_paths),
+        "cve_count": cve_count,
+        "match_count": match_count,
         "advisory_count": advisory_count,
         "objects": object_paths,
     }
@@ -115,12 +132,17 @@ def main() -> None:
 
     print(out)
     print(
-        f"wrote S3 OSV inventory with {payload['advisory_count']} advisory file(s)",
+        "wrote S3 OSV inventory with "
+        f"{payload['cve_count']} CVE file(s), "
+        f"{payload['match_count']} match file(s), and "
+        f"{payload['advisory_count']} advisory file(s)",
         file=sys.stderr,
     )
     LOGGER.info(
-        "completed S3 OSV inventory out=%s advisories=%d objects=%d",
+        "completed S3 OSV inventory out=%s cves=%d matches=%d advisories=%d objects=%d",
         out,
+        payload["cve_count"],
+        payload["match_count"],
         payload["advisory_count"],
         payload["object_count"],
     )

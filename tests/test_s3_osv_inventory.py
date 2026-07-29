@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 
 from scripts.s3_osv_inventory import (
+    is_cve_artifact_path,
+    is_match_artifact_path,
     filter_osv_inventory_paths,
     filter_osv_related_inventory_paths,
     osv_inventory_payload,
@@ -14,6 +16,19 @@ from scripts.s3_osv_inventory import (
 
 
 class S3OsvInventoryTests(unittest.TestCase):
+    def test_classifies_split_security_artifact_paths(self) -> None:
+        self.assertTrue(is_cve_artifact_path(f"cves/CVE-1/{'a' * 64}.conda"))
+        self.assertTrue(
+            is_match_artifact_path(
+                f"noarch/demo-1.2.3-py_0.matches/CVE-1/{'b' * 64}.conda"
+            )
+        )
+        self.assertFalse(
+            is_match_artifact_path(
+                f"noarch/demo-1.2.3-py_0.advisories/{'c' * 64}.conda"
+            )
+        )
+
     def test_filter_osv_inventory_paths_keeps_advisories(self) -> None:
         paths = filter_osv_inventory_paths(
             [
@@ -73,6 +88,8 @@ class S3OsvInventoryTests(unittest.TestCase):
         self.assertEqual(written["s3_uri"], "s3://demo-bucket/prefix")
         self.assertEqual(written["schema_version"], 2)
         self.assertEqual(written["object_count"], 2)
+        self.assertEqual(written["cve_count"], 1)
+        self.assertEqual(written["match_count"], 0)
         self.assertEqual(written["advisory_count"], 1)
         self.assertEqual(written["objects"], object_paths)
 
