@@ -15,6 +15,7 @@ from scripts.correlate_osv import (
     extract_component_purls,
     finalized_advisory,
     query_osv_chunked,
+    security_payload_semantic_hash,
     versioned_output_path,
     write_advisory_artifacts,
     write_advisory,
@@ -385,6 +386,105 @@ class CorrelateOsvTests(unittest.TestCase):
             real_results = write_advisory_artifacts(advisory, sbom_path=sbom_path)
 
         self.assertEqual(dry_run_paths, [result.path for result in real_results])
+
+    def test_write_advisory_artifacts_paths_ignore_run_timestamp(self) -> None:
+        advisory = {
+            "schema_version": 2,
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "source": {
+                "name": "osv.dev",
+                "api": "https://api.osv.dev/v1/querybatch",
+            },
+            "source_sbom": "noarch/demo-1.2.3-py_0.sboms/abc.conda",
+            "subject": {"name": "demo", "version": "1.2.3"},
+            "query_count": 1,
+            "vulnerability_count": 1,
+            "findings": [
+                {
+                    "component_purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "component_name": "demo-pkg",
+                    "component_version": "1.2.3",
+                    "vulnerability_id": "GHSA-demo-0001",
+                    "modified": "2026-01-01T00:00:00Z",
+                }
+            ],
+            "components": [
+                {
+                    "name": "demo-pkg",
+                    "version": "1.2.3",
+                    "purl": "pkg:pypi/demo-pkg@1.2.3",
+                    "vulnerabilities": [
+                        {
+                            "id": "GHSA-demo-0001",
+                            "modified": "2026-01-01T00:00:00Z",
+                        }
+                    ],
+                }
+            ],
+        }
+        same_content = {
+            **advisory,
+            "generated_at": "2026-01-02T00:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sbom_path = (
+                Path(tmp)
+                / "channel"
+                / "noarch"
+                / "demo-1.2.3-py_0.sboms"
+                / f"{'a' * 64}.conda"
+            )
+            first = write_advisory_artifacts(advisory, sbom_path=sbom_path, dry_run=True)
+            second = write_advisory_artifacts(
+                same_content,
+                sbom_path=sbom_path,
+                dry_run=True,
+            )
+
+        self.assertEqual([result.path for result in first], [result.path for result in second])
+        self.assertEqual(
+            [result.semantic_version for result in first],
+            [result.semantic_version for result in second],
+        )
+
+    def test_security_payload_semantic_hash_ignores_artifact_refs(self) -> None:
+        first = {
+            "schema_version": 1,
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "correlation_version": "a",
+            "cves": [
+                {"id": "GHSA-demo-0001", "path": "old", "sha256": "a", "size": 1}
+            ],
+            "matches": [
+                {"id": "GHSA-demo-0001", "path": "old", "sha256": "a", "size": 1}
+            ],
+            "findings": [{"vulnerability_id": "GHSA-demo-0001"}],
+        }
+        second = {
+            **first,
+            "generated_at": "2026-01-02T00:00:00+00:00",
+            "correlation_version": "b",
+            "cves": [
+                {"id": "GHSA-demo-0001", "path": "new", "sha256": "b", "size": 2}
+            ],
+            "matches": [
+                {"id": "GHSA-demo-0001", "path": "new", "sha256": "b", "size": 2}
+            ],
+        }
+
+        self.assertEqual(
+            security_payload_semantic_hash(
+                first,
+                kind="ADVISORIES",
+                data_schema="advisories.v1",
+            ),
+            security_payload_semantic_hash(
+                second,
+                kind="ADVISORIES",
+                data_schema="advisories.v1",
+            ),
+        )
 
     def test_write_advisory_artifacts_handles_parallel_duplicate_writes(self) -> None:
         advisory = {

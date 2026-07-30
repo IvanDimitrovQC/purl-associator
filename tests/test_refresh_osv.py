@@ -12,6 +12,7 @@ from scripts.load_progress import ProgressTracker
 from scripts.refresh_osv import (
     collect_queryable_purls,
     filter_s3_sbom_artifact_paths,
+    load_s3_logical_osv_inventory,
     load_s3_osv_inventory,
     refresh_osv,
     stage_s3_sboms,
@@ -85,7 +86,7 @@ class RefreshOsvTests(unittest.TestCase):
                     batch_size=10,
                     workers=2,
                     progress=progress,
-                    on_output=published.append,
+                    on_output=lambda artifact: published.append(artifact.path),
                 )
                 second = refresh_osv(channel_root=root, batch_size=10)
             progress_data = json.loads((Path(tmp) / "progress.json").read_text())
@@ -179,6 +180,31 @@ class RefreshOsvTests(unittest.TestCase):
                     inventory=inventory,
                 )
             )
+
+    def test_load_s3_logical_osv_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory_path = Path(tmp) / "inventory.json"
+            inventory_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 3,
+                        "objects": [],
+                        "logical_artifacts": {
+                            "cves/CVE-1": {
+                                "semantic-a": f"cves/CVE-1/{'a' * 64}.conda"
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+            inventory = load_s3_logical_osv_inventory(inventory_path)
+
+        self.assertEqual(
+            inventory,
+            {("cves/CVE-1", "semantic-a"): f"cves/CVE-1/{'a' * 64}.conda"},
+        )
 
     def test_filter_s3_sbom_artifact_paths_excludes_events_and_indexes(self) -> None:
         artifact_path = f"noarch/demo-1.2.3-py_0.sboms/{'a' * 64}.conda"

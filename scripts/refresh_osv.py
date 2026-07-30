@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import logging
 import shutil
 import subprocess
@@ -64,7 +65,7 @@ class AdvisoryArtifact:
     results: list[SecurityArtifactResult]
 
 
-OutputHandler = Callable[[Path], None]
+OutputHandler = Callable[[SecurityArtifactResult], None]
 SourceSbomResolver = Callable[[Path], str]
 
 
@@ -73,6 +74,33 @@ def load_s3_osv_inventory(path: Path) -> set[str]:
         return load_s3_object_inventory(path)
     except S3PublishError as exc:
         raise OsvError(str(exc)) from exc
+
+
+def load_s3_logical_osv_inventory(path: Path) -> dict[tuple[str, str], str]:
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except FileNotFoundError as exc:
+        raise OsvError(f"{path}: file does not exist") from exc
+    except json.JSONDecodeError as exc:
+        raise OsvError(f"{path}: invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise OsvError(f"{path}: expected a JSON object")
+    logical = data.get("logical_artifacts")
+    if not isinstance(logical, dict):
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    for artifact_dir, versions in logical.items():
+        if not isinstance(artifact_dir, str) or not isinstance(versions, dict):
+            continue
+        for semantic_version, relative_path in versions.items():
+            if isinstance(semantic_version, str) and isinstance(relative_path, str):
+                out[(artifact_dir, semantic_version)] = relative_path
+    return out
+
+
+def _artifact_dir(path: str) -> str:
+    return str(Path(path).parent).replace("\\", "/")
 
 
 def load_s3_sbom_source_inventory(path: Path) -> set[str]:
@@ -292,7 +320,7 @@ def refresh_osv(
             )
             for result in results:
                 if on_output:
-                    on_output(result.path)
+                    on_output(result)
             return AdvisoryArtifact(index=index, results=results)
         results = write_advisory_artifacts(advisory, sbom_path=sbom_path)
         LOGGER.info(
@@ -301,7 +329,7 @@ def refresh_osv(
         )
         for result in results:
             if on_output:
-                on_output(result.path)
+                on_output(result)
         return AdvisoryArtifact(index=index, results=results)
 
     def record_result(result: AdvisoryArtifact) -> None:
@@ -495,6 +523,7 @@ def main() -> None:
     cleaned = 0
     inventory_existing = 0
     s3_inventory: set[str] | None = None
+    s3_logical_inventory: dict[tuple[str, str], str] = {}
     try:
         if args.s3_osv_inventory and not args.s3_uri:
             raise OsvError("--s3-osv-inventory requires --s3-uri")
@@ -502,10 +531,12 @@ def main() -> None:
             raise OsvError("--s3-sbom-source-inventory requires --s3-sbom-source-uri")
         if args.s3_osv_inventory:
             s3_inventory = load_s3_osv_inventory(args.s3_osv_inventory)
+            s3_logical_inventory = load_s3_logical_osv_inventory(args.s3_osv_inventory)
             LOGGER.info(
-                "loaded S3 OSV inventory path=%s objects=%d",
+                "loaded S3 OSV inventory path=%s objects=%d logical_artifacts=%d",
                 args.s3_osv_inventory,
                 len(s3_inventory),
+                len(s3_logical_inventory),
             )
         if args.s3_sbom_source_uri:
             args.s3_sbom_stage_dir.mkdir(parents=True, exist_ok=True)
@@ -561,14 +592,35 @@ def main() -> None:
         else None
     )
     publish_lock = threading.Lock()
+    handled_artifacts: set[str] = set()
 
-    def publish_output(path: Path) -> None:
+    def update_advisory_index(path: Path) -> None:
+        if not (
+            index_state
+            and path.exists()
+            and path.parent.name.endswith(".advisories")
+        ):
+            return
+        LOGGER.info("updating advisory index from OSV artifact path=%s", path)
+        index_state.update_advisory(path)
+
+    def publish_output(artifact: SecurityArtifactResult) -> None:
         nonlocal s3_uploaded, s3_existing, cleaned, inventory_existing
-        if index_state and path.exists() and path.parent.name.endswith(".advisories"):
-            with publish_lock:
-                LOGGER.info("updating advisory index from OSV artifact path=%s", path)
-                index_state.update_advisory(path)
+        path = artifact.path
+        try:
+            relative_path = path.resolve().relative_to(run_channel_root.resolve()).as_posix()
+        except ValueError as exc:
+            raise S3PublishError(
+                f"{path} is not under inventory root {run_channel_root}"
+            ) from exc
+        with publish_lock:
+            if relative_path in handled_artifacts:
+                LOGGER.info("skipping duplicate local OSV artifact path=%s", path)
+                return
+            handled_artifacts.add(relative_path)
         if not args.s3_uri:
+            with publish_lock:
+                update_advisory_index(path)
             return
         publish_dry_run = args.dry_run or args.s3_dry_run
         if s3_inventory is not None and paths_present_in_inventory(
@@ -577,7 +629,7 @@ def main() -> None:
             inventory=s3_inventory,
         ):
             LOGGER.info(
-                "skipping S3 upload for inventory-present OSV advisory path=%s",
+                "skipping S3 upload for inventory-present OSV artifact path=%s",
                 path,
             )
             summary = inventory_upload_summary(
@@ -585,6 +637,46 @@ def main() -> None:
                 root=run_channel_root,
                 s3_uri=args.s3_uri,
             )
+            with publish_lock:
+                update_advisory_index(path)
+            if args.cleanup_uploaded and not publish_dry_run:
+                cleanup = cleanup_uploaded_files(summary, root=run_channel_root)
+            else:
+                cleanup = None
+            with publish_lock:
+                if cleanup:
+                    cleaned += cleanup.count
+                s3_existing += summary.existing
+                inventory_existing += summary.existing
+                if progress:
+                    progress.update(
+                        counts={
+                            "s3_uploaded": s3_uploaded,
+                            "s3_existing": s3_existing,
+                            "s3_inventory_existing": inventory_existing,
+                            "local_artifacts_cleaned": cleaned,
+                        }
+                    )
+            return
+        existing_logical = s3_logical_inventory.get(
+            (_artifact_dir(relative_path), artifact.semantic_version)
+        )
+        if existing_logical:
+            LOGGER.info(
+                "skipping S3 upload for inventory-present logical OSV artifact "
+                "path=%s existing_path=%s semantic_version=%s",
+                path,
+                existing_logical,
+                artifact.semantic_version,
+            )
+            summary = inventory_upload_summary(
+                [path],
+                root=run_channel_root,
+                s3_uri=args.s3_uri,
+            )
+            if existing_logical == relative_path:
+                with publish_lock:
+                    update_advisory_index(path)
             if args.cleanup_uploaded and not publish_dry_run:
                 cleanup = cleanup_uploaded_files(summary, root=run_channel_root)
             else:
@@ -605,7 +697,7 @@ def main() -> None:
                     )
             return
         LOGGER.info(
-            "publishing OSV advisory artifact to S3 path=%s dry_run=%s",
+            "publishing OSV artifact to S3 path=%s dry_run=%s",
             path,
             publish_dry_run,
         )
@@ -618,9 +710,11 @@ def main() -> None:
             dry_run=publish_dry_run,
             workers=args.s3_workers,
         )
+        with publish_lock:
+            update_advisory_index(path)
         if args.cleanup_uploaded and not publish_dry_run:
             LOGGER.info(
-                "cleaning local OSV advisory artifact after S3 publish path=%s",
+                "cleaning local OSV artifact after S3 publish path=%s",
                 path,
             )
             cleanup = cleanup_uploaded_files(summary, root=run_channel_root)

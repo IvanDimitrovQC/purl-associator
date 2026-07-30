@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 
 from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
 from scripts.generate_sbom import (
+    DEFAULT_SECURITY_CREATED_ON,
     SECURITY_ADVISORIES_PAYLOAD_NAME,
     SECURITY_CVE_PAYLOAD_NAME,
     SECURITY_MATCH_PAYLOAD_NAME,
@@ -64,6 +65,7 @@ class SecurityArtifactResult:
     created: bool
     kind: str
     size: int
+    semantic_version: str
 
 
 def _load_json_path(path: Path) -> dict[str, Any]:
@@ -114,6 +116,50 @@ def _created_on(timestamp: str | None = None) -> int:
         except ValueError:
             pass
     return int(datetime.now(UTC).timestamp())
+
+
+def _timestamp_seconds(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        timestamp = parsed.timestamp()
+    else:
+        return None
+    if timestamp <= 0:
+        return None
+    try:
+        datetime.fromtimestamp(timestamp, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return int(timestamp)
+
+
+def _stable_generated_at(advisory: dict[str, Any]) -> str:
+    timestamps: list[int] = []
+    for finding in advisory.get("findings") or []:
+        if isinstance(finding, dict):
+            modified = _timestamp_seconds(finding.get("modified"))
+            if modified is not None:
+                timestamps.append(modified)
+    for component in advisory.get("components") or []:
+        if not isinstance(component, dict):
+            continue
+        for vulnerability in component.get("vulnerabilities") or []:
+            if not isinstance(vulnerability, dict):
+                continue
+            modified = _timestamp_seconds(vulnerability.get("modified"))
+            if modified is not None:
+                timestamps.append(modified)
+    timestamp = max(timestamps) if timestamps else DEFAULT_SECURITY_CREATED_ON
+    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds")
 
 
 def _has_version(purl: str) -> bool:
@@ -762,6 +808,43 @@ def _security_artifact_ref(
     }
 
 
+def _strip_artifact_ref_fields(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key not in {"path", "sha256", "size"}
+    }
+
+
+def normalized_security_payload(payload: dict[str, Any], *, kind: str) -> dict[str, Any]:
+    normalized = copy.deepcopy(payload)
+    normalized.pop("generated_at", None)
+    if kind in {"MATCH", "ADVISORIES"}:
+        normalized.pop("correlation_version", None)
+    if kind == "MATCH":
+        normalized["cve"] = _strip_artifact_ref_fields(normalized.get("cve"))
+    elif kind == "ADVISORIES":
+        for key in ("cves", "matches", "vex"):
+            values = normalized.get(key)
+            if isinstance(values, list):
+                normalized[key] = [_strip_artifact_ref_fields(item) for item in values]
+    return normalized
+
+
+def security_payload_semantic_hash(
+    payload: dict[str, Any], *, kind: str, data_schema: str
+) -> str:
+    return _sha256(
+        {
+            "kind": kind,
+            "data_schema": data_schema,
+            "payload": normalized_security_payload(payload, kind=kind),
+        }
+    )
+
+
 def _write_security_payload(
     *,
     payload: dict[str, Any],
@@ -779,6 +862,11 @@ def _write_security_payload(
         payload_name=payload_name,
         created_on=created_on,
     )
+    semantic_version = security_payload_semantic_hash(
+        payload,
+        kind=kind,
+        data_schema=data_schema,
+    )
     artifact_sha256 = _sha256_bytes(artifact_bytes)
     path = out_dir / f"{artifact_sha256}.conda"
     path, created = write_content_addressed_bytes(
@@ -792,6 +880,7 @@ def _write_security_payload(
         created=created,
         kind=kind,
         size=len(artifact_bytes),
+        semantic_version=semantic_version,
     )
 
 
@@ -944,6 +1033,7 @@ def write_advisory_artifacts(
     dry_run: bool = False,
 ) -> list[SecurityArtifactResult]:
     finalized = finalized_advisory(advisory)
+    finalized["generated_at"] = _stable_generated_at(finalized)
     channel_root = _channel_root_from_sbom_path(sbom_path)
     subdir = _subdir_from_sbom_path(sbom_path)
     artifact_filename = _artifact_filename_from_sbom_path(sbom_path)

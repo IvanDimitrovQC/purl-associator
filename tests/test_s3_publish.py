@@ -7,6 +7,8 @@ from pathlib import Path
 
 from scripts.s3_publish import (
     S3PublishError,
+    S3UploadResult,
+    S3UploadSummary,
     cleanup_uploaded_files,
     download_file,
     download_files,
@@ -360,6 +362,34 @@ class S3PublishTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertEqual(cleanup.count, 1)
             self.assertFalse(path.parent.exists())
+
+    def test_cleanup_uploaded_files_tolerates_duplicate_local_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local-advisory-channel"
+            path = root / "cves" / "GHSA-demo" / f"{'a' * 64}.conda"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"artifact")
+            summary = S3UploadSummary(
+                [
+                    S3UploadResult(
+                        local_path=path,
+                        s3_uri="s3://demo-bucket/prefix/cves/GHSA-demo/artifact.conda",
+                        uploaded=True,
+                        already_exists=False,
+                    ),
+                    S3UploadResult(
+                        local_path=path,
+                        s3_uri="s3://demo-bucket/prefix/cves/GHSA-demo/artifact.conda",
+                        uploaded=True,
+                        already_exists=False,
+                    ),
+                ]
+            )
+
+            cleanup = cleanup_uploaded_files(summary, root=root)
+
+            self.assertFalse(path.exists())
+            self.assertEqual(cleanup.count, 1)
 
 
 if __name__ == "__main__":

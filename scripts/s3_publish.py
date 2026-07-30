@@ -598,13 +598,15 @@ def cleanup_uploaded_files(
         if not (result.uploaded or result.already_exists):
             continue
         path = result.local_path
-        if not path.exists():
-            continue
         try:
             path.resolve().relative_to(root_resolved)
         except ValueError as exc:
             raise S3PublishError(f"{path} is not under cleanup root {root}") from exc
-        path.unlink()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            LOGGER.info("local uploaded artifact already removed path=%s", path)
+            continue
         removed.append(path)
         LOGGER.info("removed local uploaded artifact path=%s", path)
         _remove_empty_parents(start=path.parent, stop=root)

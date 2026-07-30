@@ -34,6 +34,7 @@ export OSV_BATCH_SIZE="${OSV_BATCH_SIZE:-800}"
 export WORKERS="${WORKERS:-16}"
 export S3_WORKERS="${S3_WORKERS:-8}"
 export SBOM_INVENTORY_WORKERS="${SBOM_INVENTORY_WORKERS:-8}"
+export OSV_INVENTORY_WORKERS="${OSV_INVENTORY_WORKERS:-8}"
 export CLEANUP_UPLOADED="${CLEANUP_UPLOADED:-1}"
 export INCLUDE_MISSING_DOWNLOADS="${INCLUDE_MISSING_DOWNLOADS:-0}"
 export ALLOW_MISSING_PURL="${ALLOW_MISSING_PURL:-0}"
@@ -128,6 +129,8 @@ run pixi run -e lite sbom:s3-inventory \
 run pixi run -e lite osv:s3-inventory \
   --s3-uri="$CHANNEL" \
   "${S3_ARGS[@]}" \
+  --include-metadata \
+  --workers="$OSV_INVENTORY_WORKERS" \
   --out="$OSV_INVENTORY"
 
 run pixi run -e lite osv:refresh \
@@ -137,7 +140,6 @@ run pixi run -e lite osv:refresh \
   "${S3_ARGS[@]}" \
   --s3-osv-inventory="$OSV_INVENTORY" \
   --progress-file="$OSV_PROGRESS" \
-  --update-index \
   "${CLEANUP_ARGS[@]}" \
   --batch-size="$OSV_BATCH_SIZE" \
   --workers="$WORKERS" \
@@ -146,6 +148,8 @@ run pixi run -e lite osv:refresh \
 run pixi run -e lite osv:s3-inventory \
   --s3-uri="$CHANNEL" \
   "${S3_ARGS[@]}" \
+  --include-metadata \
+  --workers="$OSV_INVENTORY_WORKERS" \
   --out="$OSV_INVENTORY"
 
 run pixi run -e lite advisory:index \

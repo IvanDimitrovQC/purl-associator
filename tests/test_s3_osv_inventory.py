@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.correlate_osv import SECURITY_CVE_SCHEMA, security_payload_semantic_hash
+from scripts.generate_sbom import SECURITY_CVE_PAYLOAD_NAME, build_security_artifact_bytes
 from scripts.s3_osv_inventory import (
     is_cve_artifact_path,
     is_match_artifact_path,
     filter_osv_inventory_paths,
     filter_osv_related_inventory_paths,
     osv_inventory_payload,
+    read_s3_osv_metadata,
     write_inventory,
 )
 
@@ -92,6 +96,67 @@ class S3OsvInventoryTests(unittest.TestCase):
         self.assertEqual(written["match_count"], 0)
         self.assertEqual(written["advisory_count"], 1)
         self.assertEqual(written["objects"], object_paths)
+
+    def test_read_s3_osv_metadata_reads_security_container(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "id": "GHSA-demo-0001",
+            "url": "https://osv.dev/vulnerability/GHSA-demo-0001",
+            "source": {"name": "osv.dev"},
+            "modified": "2026-01-01T00:00:00Z",
+            "osv": {"id": "GHSA-demo-0001", "modified": "2026-01-01T00:00:00Z"},
+        }
+        artifact = build_security_artifact_bytes(
+            payload=payload,
+            kind="CVE",
+            data_schema=SECURITY_CVE_SCHEMA,
+            payload_name=SECURITY_CVE_PAYLOAD_NAME,
+            created_on=1767225600,
+        )
+
+        def runner(
+            cmd: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(cmd, 0, artifact, b"")
+
+        path, metadata = read_s3_osv_metadata(
+            relative_path=f"cves/GHSA-demo-0001/{'a' * 64}.conda",
+            s3_uri="s3://demo-bucket/prefix",
+            runner=runner,
+        )
+
+        self.assertEqual(path, f"cves/GHSA-demo-0001/{'a' * 64}.conda")
+        self.assertEqual(metadata["artifact_dir"], "cves/GHSA-demo-0001")
+        self.assertEqual(metadata["kind"], "CVE")
+        self.assertEqual(
+            metadata["semantic_version"],
+            security_payload_semantic_hash(
+                payload,
+                kind="CVE",
+                data_schema=SECURITY_CVE_SCHEMA,
+            ),
+        )
+
+    def test_inventory_payload_includes_logical_artifacts(self) -> None:
+        path = f"cves/CVE-1/{'a' * 64}.conda"
+        payload = osv_inventory_payload(
+            s3_uri="s3://demo-bucket/prefix",
+            object_paths=[path],
+            osv_metadata={
+                path: {
+                    "path": path,
+                    "artifact_dir": "cves/CVE-1",
+                    "kind": "CVE",
+                    "semantic_version": "semantic-a",
+                }
+            },
+        )
+
+        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(
+            payload["logical_artifacts"],
+            {"cves/CVE-1": {"semantic-a": path}},
+        )
 
 
 if __name__ == "__main__":
