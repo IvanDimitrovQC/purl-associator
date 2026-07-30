@@ -231,15 +231,50 @@ function vulnerabilitySortLabel(sort: VulnerabilitySort): string {
   );
 }
 
-function vulnerabilityId(vuln: AdvisoryVulnerability): string {
-  return vuln.id ?? vuln.url ?? vuln.component_purl ?? "";
+function cleanVulnerabilityId(value: string | null | undefined): string | null {
+  const cleaned = value?.trim();
+  if (!cleaned || cleaned.startsWith("pkg:")) return null;
+  if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) {
+    const lastSegment = cleaned.split(/[/?#]/).filter(Boolean).at(-1);
+    if (!lastSegment) return null;
+    try {
+      return decodeURIComponent(lastSegment);
+    } catch {
+      return lastSegment;
+    }
+  }
+  return cleaned;
+}
+
+function vulnerabilityId(vuln: AdvisoryVulnerability): string | null {
+  return (
+    cleanVulnerabilityId(vuln.id) ??
+    cleanVulnerabilityId(vuln.vulnerability_id) ??
+    null
+  );
+}
+
+function vulnerabilitySortKey(vuln: AdvisoryVulnerability): string {
+  return vulnerabilityId(vuln) ?? vuln.url ?? vuln.component_purl ?? "";
+}
+
+function vulnerabilityUrl(vuln: AdvisoryVulnerability): string | null {
+  if (vuln.url) return vuln.url;
+  for (const value of [vuln.id, vuln.vulnerability_id]) {
+    const cleaned = value?.trim();
+    if (cleaned?.startsWith("http://") || cleaned?.startsWith("https://")) {
+      return cleaned;
+    }
+  }
+  const id = vulnerabilityId(vuln);
+  return id ? `https://osv.dev/vulnerability/${encodeURIComponent(id)}` : null;
 }
 
 function compareVulnerabilitiesById(
   a: AdvisoryVulnerability,
   b: AdvisoryVulnerability,
 ): number {
-  return vulnerabilityId(a).localeCompare(vulnerabilityId(b), undefined, {
+  return vulnerabilitySortKey(a).localeCompare(vulnerabilitySortKey(b), undefined, {
     numeric: true,
   });
 }
@@ -792,81 +827,113 @@ function VulnerabilityList({
           </select>
         </label>
       </div>
-      {sortedVulnerabilities.map((vuln, index) => (
-        <div
-          key={`${vuln.id}-${vuln.component_purl}-${index}`}
-          style={{
-            border: `1px solid ${theme.t.border}`,
-            borderRadius: 6,
-            padding: 9,
-            background: theme.t.surface2,
-          }}
-        >
+      {sortedVulnerabilities.map((vuln, index) => {
+        const id = vulnerabilityId(vuln);
+        const url = vulnerabilityUrl(vuln);
+        return (
           <div
+            key={`${id ?? vuln.url ?? "unknown"}-${vuln.component_purl}-${index}`}
             style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: 10,
-              marginBottom: 5,
+              border: `1px solid ${theme.t.border}`,
+              borderRadius: 6,
+              padding: 9,
+              background: theme.t.surface2,
             }}
           >
             <div
               style={{
-                minWidth: 0,
                 display: "flex",
                 alignItems: "center",
-                gap: 7,
+                justifyContent: "space-between",
+                gap: 10,
+                marginBottom: 6,
               }}
             >
-              {vuln.url ? (
-                <a
-                  href={vuln.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{
-                    minWidth: 0,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    fontFamily: "JetBrains Mono, monospace",
-                    fontWeight: 700,
-                    color: theme.t.bad,
-                    fontSize: 12,
-                    textDecoration: "none",
-                  }}
-                >
-                  {vuln.id ?? "unknown"}
-                </a>
-              ) : (
-                <span
-                  style={{
-                    minWidth: 0,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    fontFamily: "JetBrains Mono, monospace",
-                    fontWeight: 700,
-                    color: theme.t.bad,
-                    fontSize: 12,
-                  }}
-                >
-                  {vuln.id ?? "unknown"}
+              <span
+                style={{
+                  minWidth: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                }}
+              >
+                {url ? (
+                  <a
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={url}
+                    style={{
+                      minWidth: 0,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      fontFamily: "JetBrains Mono, monospace",
+                      fontWeight: 700,
+                      color: theme.t.link,
+                      fontSize: 12,
+                      textDecoration: "underline",
+                      textUnderlineOffset: 2,
+                    }}
+                  >
+                    <span
+                      style={{
+                        minWidth: 0,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {id ?? "Unknown advisory"}
+                    </span>
+                    <Glyph name="link" size={10} />
+                  </a>
+                ) : (
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      fontFamily: "JetBrains Mono, monospace",
+                      fontWeight: 700,
+                      color: theme.t.bad,
+                      fontSize: 12,
+                    }}
+                  >
+                    {id ?? "Unknown advisory"}
+                  </span>
+                )}
+                <span title={severityTitle(vuln)}>
+                  <Badge theme={theme} tone={severityTone(vuln.severity)}>
+                    {severityDisplay(vuln)}
+                  </Badge>
                 </span>
-              )}
-              <span title={severityTitle(vuln)}>
-                <Badge theme={theme} tone={severityTone(vuln.severity)}>
-                  {severityDisplay(vuln)}
-                </Badge>
+              </span>
+              <span style={{ color: theme.t.fg3, fontSize: 11 }}>
+                {vuln.modified ?? ""}
               </span>
             </div>
-            <span style={{ color: theme.t.fg3, fontSize: 11 }}>
-              {vuln.modified ?? ""}
-            </span>
+            {vuln.component_purl ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span
+                  style={{
+                    color: theme.t.fg3,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Component
+                </span>
+                <MonospaceValue value={vuln.component_purl} theme={theme} />
+              </div>
+            ) : null}
           </div>
-          <MonospaceValue value={vuln.component_purl} theme={theme} />
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

@@ -127,6 +127,7 @@ export type GitHubUser = {
 
 export type AdvisoryVulnerability = {
   id: string | null;
+  vulnerability_id?: string | null;
   url?: string | null;
   component_purl?: string | null;
   component_name?: string | null;

@@ -353,9 +353,17 @@ def _url_for_vulnerability(vulnerability_id: Any, explicit_url: Any) -> str | No
     return None
 
 
+def _vulnerability_identifier(vulnerability: dict[str, Any]) -> str | None:
+    for key in ("id", "vulnerability_id"):
+        value = vulnerability.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _vulnerability_id(vulnerability: dict[str, Any]) -> tuple[str, str, str]:
     return (
-        str(vulnerability.get("id") or ""),
+        str(_vulnerability_identifier(vulnerability) or ""),
         str(vulnerability.get("component_purl") or ""),
         str(vulnerability.get("component_version") or ""),
     )
@@ -379,7 +387,7 @@ def vulnerability_indexes(
         for vulnerability in vulnerabilities:
             if not isinstance(vulnerability, dict):
                 continue
-            vuln_id = vulnerability.get("id")
+            vuln_id = _vulnerability_identifier(vulnerability)
             item = {
                 "id": vuln_id,
                 "component_purl": vulnerability.get("component_purl"),
@@ -425,9 +433,10 @@ def _indexed_vulnerabilities(osv: dict[str, Any]) -> list[dict[str, Any]]:
     for vulnerability in _as_list(osv.get("vulnerabilities")):
         if not isinstance(vulnerability, dict):
             continue
-        vuln_id = vulnerability.get("id")
+        vuln_id = _vulnerability_identifier(vulnerability)
         item = {
             **vulnerability,
+            "id": vuln_id,
             "url": _url_for_vulnerability(vuln_id, vulnerability.get("url")),
         }
         vulnerabilities.append(item)
@@ -531,9 +540,10 @@ def _dedupe_vulnerabilities(
 ) -> list[dict[str, Any]]:
     by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     for vulnerability in vulnerabilities:
-        vuln_id = vulnerability.get("id")
+        vuln_id = _vulnerability_identifier(vulnerability)
         normalized = {
             **vulnerability,
+            "id": vuln_id,
             "url": _url_for_vulnerability(vuln_id, vulnerability.get("url")),
         }
         by_key.setdefault(_vulnerability_id(normalized), normalized)
