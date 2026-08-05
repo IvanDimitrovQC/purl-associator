@@ -40,6 +40,7 @@ python = ">=3.13,<3.14"
 "vex:write" = "python -m scripts.write_vex"
 "advisory:index" = "python -m scripts.advisory_index"
 "advisory:dashboard-data" = "python -m scripts.advisory_dashboard_data"
+"rust:advisory-channel" = "python -m scripts.rust_crate_advisory_channel"
 "sbom:test" = "python -m unittest discover -s tests"
 
 [environments]

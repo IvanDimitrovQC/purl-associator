@@ -842,79 +842,78 @@ function VulnerabilityList({
           >
             <div
               style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 10,
-                marginBottom: 6,
+                display: "grid",
+                gap: 6,
+                marginBottom: 8,
               }}
             >
-              <span
+              {url ? (
+                <a
+                  href={url}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={url}
+                  style={{
+                    minWidth: 0,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    maxWidth: "100%",
+                    overflowWrap: "anywhere",
+                    lineHeight: 1.35,
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontWeight: 700,
+                    color: theme.t.link,
+                    fontSize: 12,
+                    textDecoration: "underline",
+                    textUnderlineOffset: 2,
+                  }}
+                >
+                  <span>{id ?? "Unknown advisory"}</span>
+                  <Glyph name="link" size={10} />
+                </a>
+              ) : (
+                <span
+                  style={{
+                    minWidth: 0,
+                    overflowWrap: "anywhere",
+                    lineHeight: 1.35,
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontWeight: 700,
+                    color: theme.t.bad,
+                    fontSize: 12,
+                  }}
+                >
+                  {id ?? "Unknown advisory"}
+                </span>
+              )}
+              <div
                 style={{
-                  minWidth: 0,
                   display: "flex",
                   alignItems: "center",
+                  justifyContent: "space-between",
+                  flexWrap: "wrap",
                   gap: 7,
+                  minWidth: 0,
                 }}
               >
-                {url ? (
-                  <a
-                    href={url}
-                    target="_blank"
-                    rel="noreferrer"
-                    title={url}
-                    style={{
-                      minWidth: 0,
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 5,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      fontFamily: "JetBrains Mono, monospace",
-                      fontWeight: 700,
-                      color: theme.t.link,
-                      fontSize: 12,
-                      textDecoration: "underline",
-                      textUnderlineOffset: 2,
-                    }}
-                  >
-                    <span
-                      style={{
-                        minWidth: 0,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {id ?? "Unknown advisory"}
-                    </span>
-                    <Glyph name="link" size={10} />
-                  </a>
-                ) : (
-                  <span
-                    style={{
-                      minWidth: 0,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      fontFamily: "JetBrains Mono, monospace",
-                      fontWeight: 700,
-                      color: theme.t.bad,
-                      fontSize: 12,
-                    }}
-                  >
-                    {id ?? "Unknown advisory"}
-                  </span>
-                )}
                 <span title={severityTitle(vuln)}>
                   <Badge theme={theme} tone={severityTone(vuln.severity)}>
                     {severityDisplay(vuln)}
                   </Badge>
                 </span>
-              </span>
-              <span style={{ color: theme.t.fg3, fontSize: 11 }}>
-                {vuln.modified ?? ""}
-              </span>
+                {vuln.modified ? (
+                  <span
+                    style={{
+                      color: theme.t.fg3,
+                      fontSize: 11,
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    {vuln.modified}
+                  </span>
+                ) : null}
+              </div>
             </div>
             {vuln.component_purl ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
