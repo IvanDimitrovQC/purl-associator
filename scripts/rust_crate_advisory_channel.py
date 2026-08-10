@@ -104,6 +104,7 @@ class CondaLockRecord:
     md5: str | None
     license: str | None
     timestamp: int | None
+    build_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -250,7 +251,11 @@ def load_lock_records(path: Path) -> list[CondaLockRecord]:
         if not isinstance(data, dict):
             raise RustCrateChannelError(f"{path}: expected lockfile mapping")
         packages = data.get("packages")
-        raw_records = [r for r in packages if isinstance(r, dict)] if isinstance(packages, list) else []
+        raw_records = (
+            [r for r in packages if isinstance(r, dict)]
+            if isinstance(packages, list)
+            else []
+        )
 
     records: list[CondaLockRecord] = []
     for raw in raw_records:
@@ -267,10 +272,19 @@ def load_lock_records(path: Path) -> list[CondaLockRecord]:
                 subdir=subdir,
                 filename=filename,
                 url=url,
-                sha256=raw.get("sha256") if isinstance(raw.get("sha256"), str) else None,
+                sha256=raw.get("sha256")
+                if isinstance(raw.get("sha256"), str)
+                else None,
                 md5=raw.get("md5") if isinstance(raw.get("md5"), str) else None,
-                license=raw.get("license") if isinstance(raw.get("license"), str) else None,
+                license=raw.get("license")
+                if isinstance(raw.get("license"), str)
+                else None,
                 timestamp=timestamp if isinstance(timestamp, int) else None,
+                build_number=(
+                    raw.get("build_number")
+                    if isinstance(raw.get("build_number"), int)
+                    else None
+                ),
             )
         )
     return records
@@ -279,7 +293,11 @@ def load_lock_records(path: Path) -> list[CondaLockRecord]:
 def _record_timestamp(record: CondaLockRecord) -> str:
     if record.timestamp is None:
         return DEFAULT_SBOM_TIMESTAMP
-    timestamp = record.timestamp / 1000 if record.timestamp >= 10_000_000_000 else record.timestamp
+    timestamp = (
+        record.timestamp / 1000
+        if record.timestamp >= 10_000_000_000
+        else record.timestamp
+    )
     try:
         return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds")
     except (OSError, OverflowError, ValueError):
@@ -390,9 +408,11 @@ def cargo_graph_from_audit_info(path: Path, payload: dict[str, Any]) -> CargoGra
         if isinstance(kind, str):
             component["scope"] = "optional" if kind == "build" else "required"
         dependencies = package.get("dependencies")
-        raw_dependencies[purl] = [
-            dep for dep in dependencies if isinstance(dep, int)
-        ] if isinstance(dependencies, list) else []
+        raw_dependencies[purl] = (
+            [dep for dep in dependencies if isinstance(dep, int)]
+            if isinstance(dependencies, list)
+            else []
+        )
 
     dependencies: list[dict[str, Any]] = []
     referenced: set[str] = set()
@@ -447,7 +467,7 @@ def fallback_cargo_graph(record: CondaLockRecord) -> CargoGraph | None:
 
 
 def _record_input(record: CondaLockRecord) -> dict[str, Any]:
-    return {
+    out = {
         "name": record.name,
         "version": record.version,
         "build": record.build,
@@ -459,6 +479,9 @@ def _record_input(record: CondaLockRecord) -> dict[str, Any]:
         "license": record.license,
         "timestamp": record.timestamp,
     }
+    if record.build_number is not None:
+        out["build_number"] = record.build_number
+    return out
 
 
 def build_rust_crate_sbom(
@@ -509,6 +532,7 @@ def build_rust_crate_sbom(
             ("conda:subdir", record.subdir),
             ("conda:filename", record.filename),
             ("conda:build", record.build),
+            ("conda:build_number", record.build_number),
             ("rust-crate-sbom:source", cargo_graph.source),
             ("rust-crate-sbom:audit-info", cargo_graph.source_path),
         ),
@@ -653,7 +677,9 @@ def write_osv_artifacts(
     batch_size: int,
     skip_osv: bool,
 ) -> list[Path]:
-    all_purls = sorted({purl for package in packages for purl in _component_purls(package.sbom)})
+    all_purls = sorted(
+        {purl for package in packages for purl in _component_purls(package.sbom)}
+    )
     LOGGER.info("prepared Cargo PURLs for OSV query count=%d", len(all_purls))
     if skip_osv:
         osv_results: dict[str, list[dict[str, Any]]] = {purl: [] for purl in all_purls}
@@ -701,11 +727,14 @@ def update_indexes_for_paths(
     artifact_paths: list[Path],
 ) -> list[Path]:
     state = AdvisoryIndexState.load(channel_root=channel_root, channel=channel)
-    for path in sorted(artifact_paths):
-        if _is_sbom_artifact_path(path):
-            state.update_sbom(path)
-        elif _is_advisories_artifact_path(path):
-            state.update_advisory(path)
+    sbom_paths = sorted(path for path in artifact_paths if _is_sbom_artifact_path(path))
+    advisory_paths = sorted(
+        path for path in artifact_paths if _is_advisories_artifact_path(path)
+    )
+    for path in sbom_paths:
+        state.update_sbom(path)
+    for path in advisory_paths:
+        state.update_advisory(path)
     return state.write()
 
 

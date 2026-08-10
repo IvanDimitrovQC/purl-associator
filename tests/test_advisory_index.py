@@ -18,10 +18,11 @@ from scripts.generate_sbom import (
     build_security_sbom_artifact_bytes,
     write_versioned_sbom,
 )
+from scripts.rust_crate_advisory_channel import update_indexes_for_paths
 
 
 class AdvisoryIndexTests(unittest.TestCase):
-    def _sbom(self) -> dict:
+    def _sbom(self, *, version: str = "sbom123") -> dict:
         return {
             "bomFormat": "CycloneDX",
             "specVersion": "1.6",
@@ -32,10 +33,10 @@ class AdvisoryIndexTests(unittest.TestCase):
                     "purl": "pkg:conda/conda-forge/demo@1.2.3?subdir=noarch",
                     "properties": [
                         {"name": "conda:build", "value": "py_0"},
-                        {"name": "sbom-generator:version", "value": "sbom123"},
+                        {"name": "sbom-generator:version", "value": version},
                         {
                             "name": "sbom-generator:input-sha256",
-                            "value": "a" * 64,
+                            "value": version.encode().hex().ljust(64, "0")[:64],
                         },
                         {
                             "name": "purl-associator:mapping-sha256",
@@ -57,11 +58,13 @@ class AdvisoryIndexTests(unittest.TestCase):
             ],
         }
 
-    def _advisory(self) -> dict:
+    def _advisory(
+        self, *, source_sbom: str = "noarch/demo-1.2.3-py_0.sboms/placeholder.conda"
+    ) -> dict:
         return {
             "schema_version": 1,
             "correlation_version": "osv123",
-            "source_sbom": "noarch/demo-1.2.3-py_0.sboms/placeholder.conda",
+            "source_sbom": source_sbom,
             "subject": {
                 "name": "demo",
                 "version": "1.2.3",
@@ -107,9 +110,13 @@ class AdvisoryIndexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "local-advisory-channel"
             sbom_path = self._write_security_sbom(root)
-            advisory_path = root / "noarch" / "advisories" / (
-                "demo-1.2.3-py_0.conda"
-            ) / "osv-sbom123-osv123.json"
+            advisory_path = (
+                root
+                / "noarch"
+                / "advisories"
+                / ("demo-1.2.3-py_0.conda")
+                / "osv-sbom123-osv123.json"
+            )
             advisory_path.parent.mkdir(parents=True)
             advisory_path.write_text(json.dumps(self._advisory()) + "\n")
 
@@ -120,8 +127,9 @@ class AdvisoryIndexTests(unittest.TestCase):
             channel_index = json.loads((root / "channel-index.json").read_text())
             shard_entry = subdir_index["shards"]["demo"]
             shard = json.loads(
-                (root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json")
-                .read_text()
+                (
+                    root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json"
+                ).read_text()
             )
             relative_sbom_path = f"noarch/demo-1.2.3-py_0.sboms/{sbom_path.name}"
             sbom_sha256 = sbom_path.stem
@@ -166,9 +174,7 @@ class AdvisoryIndexTests(unittest.TestCase):
             sbom_path = self._write_security_sbom(root)
             advisory = {
                 **self._advisory(),
-                "source_sbom": (
-                    f"noarch/demo-1.2.3-py_0.sboms/{sbom_path.name}"
-                ),
+                "source_sbom": (f"noarch/demo-1.2.3-py_0.sboms/{sbom_path.name}"),
             }
             write_advisory_artifacts(advisory, sbom_path=sbom_path)
 
@@ -178,8 +184,9 @@ class AdvisoryIndexTests(unittest.TestCase):
             )
             shard_entry = subdir_index["shards"]["demo"]
             shard = json.loads(
-                (root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json")
-                .read_text()
+                (
+                    root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json"
+                ).read_text()
             )
 
         record = shard["packages.conda"]["demo-1.2.3-py_0.conda"]
@@ -259,8 +266,9 @@ class AdvisoryIndexTests(unittest.TestCase):
             )
             shard_entry = subdir_index["shards"]["demo"]
             shard = json.loads(
-                (root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json")
-                .read_text()
+                (
+                    root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json"
+                ).read_text()
             )
 
         self.assertEqual(len(paths), 3)
@@ -270,6 +278,64 @@ class AdvisoryIndexTests(unittest.TestCase):
         self.assertEqual(record["sboms"]["sbom.v1"]["size"], len(sbom_artifact))
         self.assertEqual(sum(1 for call in calls if "list-objects-v2" in call), 1)
         self.assertEqual(sum(1 for call in calls if "cp" in call), 2)
+
+    def test_incremental_update_applies_new_sbom_before_new_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local-advisory-channel"
+            old_sbom_path, _created = write_versioned_sbom(
+                sbom=self._sbom(version="old-sbom"),
+                root=root,
+                subdir="noarch",
+                filename="demo-1.2.3-py_0.conda",
+            )
+            old_advisory = self._advisory(
+                source_sbom=f"noarch/demo-1.2.3-py_0.sboms/{old_sbom_path.name}"
+            )
+            write_advisory_artifacts(old_advisory, sbom_path=old_sbom_path)
+            build_indexes(channel_root=root, channel="conda-forge")
+
+            new_sbom_path, _created = write_versioned_sbom(
+                sbom=self._sbom(version="new-sbom"),
+                root=root,
+                subdir="noarch",
+                filename="demo-1.2.3-py_0.conda",
+            )
+            new_advisory = self._advisory(
+                source_sbom=f"noarch/demo-1.2.3-py_0.sboms/{new_sbom_path.name}"
+            )
+            new_advisory["correlation_version"] = "new-osv"
+            new_advisory_paths = write_advisory_artifacts(
+                new_advisory, sbom_path=new_sbom_path
+            )
+            new_rollup_path = next(
+                result.path
+                for result in new_advisory_paths
+                if ".advisories/" in result.path.as_posix()
+            )
+
+            update_indexes_for_paths(
+                channel_root=root,
+                channel="conda-forge",
+                artifact_paths=[new_rollup_path, new_sbom_path],
+            )
+            subdir_index = json.loads(
+                (root / "noarch" / "advisory-channel.json").read_text()
+            )
+            shard_entry = subdir_index["shards"]["demo"]
+            shard = json.loads(
+                (
+                    root / "noarch" / SHARDS_DIR / f"{shard_entry['sha256']}.json"
+                ).read_text()
+            )
+
+        record = shard["packages.conda"]["demo-1.2.3-py_0.conda"]
+        expected_source_sbom = f"noarch/demo-1.2.3-py_0.sboms/{new_sbom_path.name}"
+        self.assertEqual(record["sboms"]["sbom.v1"]["current"], expected_source_sbom)
+        self.assertEqual(
+            record["osv"]["current"],
+            new_rollup_path.relative_to(root).as_posix(),
+        )
+        self.assertEqual(record["osv"]["source_sbom"], expected_source_sbom)
 
 
 if __name__ == "__main__":
