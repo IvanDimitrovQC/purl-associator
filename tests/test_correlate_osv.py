@@ -11,6 +11,7 @@ from unittest.mock import patch
 from scripts.correlate_osv import (
     advisory_content_hash,
     correlate_sbom,
+    default_osv_vulnerability_url,
     default_output_path,
     extract_component_purls,
     finalized_advisory,
@@ -105,6 +106,13 @@ class CorrelateOsvTests(unittest.TestCase):
             advisory["skipped_components"][0]["reason"],
             "component PURL is not versioned",
         )
+
+    def test_default_osv_vulnerability_url_only_links_external_ids(self) -> None:
+        self.assertEqual(
+            default_osv_vulnerability_url("GHSA-demo-0001"),
+            "https://osv.dev/vulnerability/GHSA-demo-0001",
+        )
+        self.assertIsNone(default_osv_vulnerability_url("CONDA-2026-00001"))
 
     def test_query_osv_chunked_hydrates_unique_vulnerability_details(self) -> None:
         query_responses = [

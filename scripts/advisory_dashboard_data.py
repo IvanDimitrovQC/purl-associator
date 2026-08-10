@@ -15,7 +15,7 @@ from typing import Any
 
 from scripts.cli_logging import add_logging_args, configure_logging, print_log_location
 from scripts.advisory_index import SHARDS_DIR
-from scripts.correlate_osv import osv_vulnerability_url
+from scripts.correlate_osv import default_osv_vulnerability_url
 from scripts.generate_sboms import load_mapping_entries
 from scripts.s3_publish import (
     Runner,
@@ -32,6 +32,7 @@ DEFAULT_OSV_SUMMARY = Path(".tmp") / "osv-vulnerability-summary.json"
 DEFAULT_WORKERS = 8
 ADVISORY_DASHBOARD_SCHEMA_VERSION = 2
 LOGGER = logging.getLogger("scripts.advisory_dashboard_data")
+AdvisoryChannelSource = dict[str, Any]
 
 
 class DashboardDataError(RuntimeError):
@@ -96,6 +97,37 @@ def read_s3_json(
     if not isinstance(data, dict):
         raise DashboardDataError(f"{source}: expected a JSON object")
     return data
+
+
+def _is_s3_uri(value: str) -> bool:
+    return value.startswith("s3://")
+
+
+def _local_channel_path(*, relative_path: str, channel_uri: str) -> Path:
+    root = channel_uri.removeprefix("file://")
+    return Path(root).expanduser() / relative_path.strip("/")
+
+
+def read_channel_json(
+    *,
+    relative_path: str,
+    channel_uri: str,
+    profile: str | None = None,
+    region: str | None = None,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    if _is_s3_uri(channel_uri):
+        return read_s3_json(
+            relative_path=relative_path,
+            s3_uri=channel_uri,
+            profile=profile,
+            region=region,
+            runner=runner,
+        )
+
+    path = _local_channel_path(relative_path=relative_path, channel_uri=channel_uri)
+    LOGGER.info("reading local advisory-channel JSON source=%s", path)
+    return _load_json_path(path)
 
 
 def _shard_relative_path(*, subdir_index: dict[str, Any], entry: Any) -> str | None:
@@ -164,9 +196,9 @@ def expand_s3_sharded_indexes(
         for index, (subdir_index, shard_path) in enumerate(shard_reads):
             shard_results[index] = (
                 subdir_index,
-                read_s3_json(
+                read_channel_json(
                     relative_path=shard_path,
-                    s3_uri=s3_uri,
+                    channel_uri=s3_uri,
                     profile=profile,
                     region=region,
                     runner=runner,
@@ -176,9 +208,9 @@ def expand_s3_sharded_indexes(
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(
-                    read_s3_json,
+                    read_channel_json,
                     relative_path=shard_path,
-                    s3_uri=s3_uri,
+                    channel_uri=s3_uri,
                     profile=profile,
                     region=region,
                     runner=runner,
@@ -214,9 +246,9 @@ def load_s3_advisory_indexes(
     runner: Runner = subprocess.run,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     _validate_workers(workers)
-    channel_index = read_s3_json(
+    channel_index = read_channel_json(
         relative_path="channel-index.json",
-        s3_uri=s3_uri,
+        channel_uri=s3_uri,
         profile=profile,
         region=region,
         runner=runner,
@@ -234,9 +266,9 @@ def load_s3_advisory_indexes(
 
     if workers == 1 or len(index_paths) <= 1:
         subdir_indexes = [
-            read_s3_json(
+            read_channel_json(
                 relative_path=path,
-                s3_uri=s3_uri,
+                channel_uri=s3_uri,
                 profile=profile,
                 region=region,
                 runner=runner,
@@ -256,9 +288,9 @@ def load_s3_advisory_indexes(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
-                read_s3_json,
+                read_channel_json,
                 relative_path=path,
-                s3_uri=s3_uri,
+                channel_uri=s3_uri,
                 profile=profile,
                 region=region,
                 runner=runner,
@@ -311,6 +343,120 @@ def empty_osv_summary() -> dict[str, Any]:
     }
 
 
+def _default_channel_name(s3_uri: str, *, priority: int) -> str:
+    clean = s3_uri.rstrip("/")
+    tail = clean.rsplit("/", 1)[-1]
+    return tail or f"channel-{priority + 1}"
+
+
+def parse_advisory_channel_arg(value: str, *, priority: int) -> AdvisoryChannelSource:
+    raw = value.strip()
+    if not raw:
+        raise DashboardDataError("--advisory-channel must not be empty")
+    if "=" in raw:
+        name, s3_uri = raw.split("=", 1)
+        name = name.strip()
+        s3_uri = s3_uri.strip()
+        if not name or not s3_uri:
+            raise DashboardDataError(
+                "--advisory-channel must be NAME=s3://bucket/prefix or NAME=path"
+            )
+    else:
+        s3_uri = raw
+        name = _default_channel_name(s3_uri, priority=priority)
+    return {
+        "name": name,
+        "s3_uri": s3_uri,
+        "priority": priority,
+    }
+
+
+def resolve_advisory_channels(
+    *,
+    s3_uri: str | None,
+    advisory_channel_args: list[str],
+) -> list[AdvisoryChannelSource]:
+    if advisory_channel_args:
+        return [
+            parse_advisory_channel_arg(value, priority=index)
+            for index, value in enumerate(advisory_channel_args)
+        ]
+    if s3_uri:
+        return [
+            {
+                "name": _default_channel_name(s3_uri, priority=0),
+                "s3_uri": s3_uri,
+                "priority": 0,
+            }
+        ]
+    raise DashboardDataError("--s3-uri or --advisory-channel is required")
+
+
+def _source_name(source: AdvisoryChannelSource | None) -> str | None:
+    name = source.get("name") if isinstance(source, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def _source_uri(source: AdvisoryChannelSource | None) -> str | None:
+    s3_uri = source.get("s3_uri") if isinstance(source, dict) else None
+    return s3_uri if isinstance(s3_uri, str) and s3_uri else None
+
+
+def _source_priority(source: AdvisoryChannelSource | None) -> int | None:
+    priority = source.get("priority") if isinstance(source, dict) else None
+    return priority if isinstance(priority, int) else None
+
+
+def _source_ref(source: AdvisoryChannelSource | None) -> dict[str, Any] | None:
+    name = _source_name(source)
+    s3_uri = _source_uri(source)
+    priority = _source_priority(source)
+    if name is None and s3_uri is None:
+        return None
+    out: dict[str, Any] = {}
+    if name is not None:
+        out["name"] = name
+    if s3_uri is not None:
+        out["s3_uri"] = s3_uri
+    if priority is not None:
+        out["priority"] = priority
+    return out
+
+
+def _state_with_source(
+    state: dict[str, Any],
+    *,
+    source: AdvisoryChannelSource | None,
+) -> dict[str, Any]:
+    out = dict(state)
+    name = _source_name(source)
+    s3_uri = _source_uri(source)
+    priority = _source_priority(source)
+    if name is not None:
+        out["advisory_channel"] = name
+    if s3_uri is not None:
+        out["advisory_channel_uri"] = s3_uri
+    if priority is not None:
+        out["advisory_channel_priority"] = priority
+    return out
+
+
+def _vulnerability_with_source(
+    vulnerability: dict[str, Any],
+    *,
+    source: AdvisoryChannelSource | None,
+) -> dict[str, Any]:
+    out = dict(vulnerability)
+    source_ref = _source_ref(source)
+    if source_ref is None:
+        return out
+    out["advisory_channel"] = source_ref.get("name")
+    out["advisory_channel_uri"] = source_ref.get("s3_uri")
+    out["advisory_channel_priority"] = source_ref.get("priority")
+    out["advisory_channels"] = [source_ref]
+    return out
+
+
 def _version_sort_key(version: str | None) -> tuple:
     if not version:
         return ()
@@ -349,7 +495,7 @@ def _url_for_vulnerability(vulnerability_id: Any, explicit_url: Any) -> str | No
     if isinstance(explicit_url, str) and explicit_url:
         return explicit_url
     if isinstance(vulnerability_id, str) and vulnerability_id:
-        return osv_vulnerability_url(vulnerability_id)
+        return default_osv_vulnerability_url(vulnerability_id)
     return None
 
 
@@ -367,6 +513,97 @@ def _vulnerability_id(vulnerability: dict[str, Any]) -> tuple[str, str, str]:
         str(vulnerability.get("component_purl") or ""),
         str(vulnerability.get("component_version") or ""),
     )
+
+
+def _vulnerability_channels(vulnerability: dict[str, Any]) -> list[dict[str, Any]]:
+    channels: list[dict[str, Any]] = []
+    for value in _as_list(vulnerability.get("advisory_channels")):
+        if not isinstance(value, dict):
+            continue
+        name = value.get("name")
+        s3_uri = value.get("s3_uri")
+        priority = value.get("priority")
+        entry: dict[str, Any] = {}
+        if isinstance(name, str) and name:
+            entry["name"] = name
+        if isinstance(s3_uri, str) and s3_uri:
+            entry["s3_uri"] = s3_uri
+        if isinstance(priority, int):
+            entry["priority"] = priority
+        if entry:
+            channels.append(entry)
+
+    name = vulnerability.get("advisory_channel")
+    s3_uri = vulnerability.get("advisory_channel_uri")
+    priority = vulnerability.get("advisory_channel_priority")
+    if isinstance(name, str) and name:
+        entry = {"name": name}
+        if isinstance(s3_uri, str) and s3_uri:
+            entry["s3_uri"] = s3_uri
+        if isinstance(priority, int):
+            entry["priority"] = priority
+        channels.append(entry)
+
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for channel in channels:
+        key = (str(channel.get("name") or ""), str(channel.get("s3_uri") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(channel)
+    return sorted(
+        out,
+        key=lambda item: (
+            int(item.get("priority")) if isinstance(item.get("priority"), int) else 0,
+            str(item.get("name") or ""),
+        ),
+    )
+
+
+def _source_advisories(vulnerability: dict[str, Any]) -> list[str]:
+    paths = [
+        value
+        for value in _as_list(vulnerability.get("source_advisories"))
+        if isinstance(value, str) and value
+    ]
+    value = vulnerability.get("source_advisory")
+    if isinstance(value, str) and value:
+        paths.append(value)
+    return sorted(dict.fromkeys(paths))
+
+
+def _merge_vulnerability(
+    existing: dict[str, Any],
+    update: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in update.items():
+        if key in {
+            "advisory_channel",
+            "advisory_channel_uri",
+            "advisory_channel_priority",
+            "advisory_channels",
+            "source_advisories",
+        }:
+            continue
+        if merged.get(key) is None and value is not None:
+            merged[key] = value
+
+    channels = _vulnerability_channels(existing) + _vulnerability_channels(update)
+    if channels:
+        merged_channels = _vulnerability_channels({"advisory_channels": channels})
+        merged["advisory_channels"] = merged_channels
+        preferred = merged_channels[-1]
+        merged["advisory_channel"] = preferred.get("name")
+        merged["advisory_channel_uri"] = preferred.get("s3_uri")
+        merged["advisory_channel_priority"] = preferred.get("priority")
+
+    advisories = _source_advisories(existing) + _source_advisories(update)
+    if advisories:
+        merged["source_advisories"] = sorted(dict.fromkeys(advisories))
+        merged["source_advisory"] = merged["source_advisories"][-1]
+    return merged
 
 
 def vulnerability_indexes(
@@ -421,7 +658,7 @@ def _placeholder_vulnerabilities(osv: dict[str, Any]) -> list[dict[str, Any]]:
             out.append(
                 {
                     "id": finding_id,
-                    "url": osv_vulnerability_url(finding_id),
+                    "url": default_osv_vulnerability_url(finding_id),
                     "source_advisory": current,
                 }
             )
@@ -460,6 +697,7 @@ def artifact_from_record(
     filename: str,
     record: dict[str, Any],
     vulnerabilities_by_advisory: dict[str, list[dict[str, Any]]],
+    advisory_channel: AdvisoryChannelSource | None = None,
 ) -> dict[str, Any]:
     sbom = _current_sbom_record(record)
     osv = _as_dict(record.get("osv"))
@@ -472,7 +710,14 @@ def artifact_from_record(
         vulnerabilities = _indexed_vulnerabilities(osv)
     if not vulnerabilities and int(osv.get("vulnerability_count") or 0) > 0:
         vulnerabilities = _placeholder_vulnerabilities(osv)
+    vulnerabilities = [
+        _vulnerability_with_source(vulnerability, source=advisory_channel)
+        for vulnerability in vulnerabilities
+        if isinstance(vulnerability, dict)
+    ]
     vulnerability_count = int(osv.get("vulnerability_count") or len(vulnerabilities))
+    channel_ref = _source_ref(advisory_channel)
+    advisory_channels = [channel_ref] if channel_ref is not None else []
     return {
         "filename": filename,
         "name": record.get("name"),
@@ -480,27 +725,178 @@ def artifact_from_record(
         "subdir": record.get("subdir"),
         "build": record.get("build"),
         "conda_purl": record.get("conda_purl"),
+        "advisory_channels": advisory_channels,
         "component_purls": _as_list(sbom.get("component_purls")),
-        "sbom": {
-            "exists": _bool_exists(sbom_current),
-            "path": sbom_current,
-            "version": sbom.get("version"),
-            "input_sha256": sbom.get("input_sha256")
-            if sbom.get("input_sha256") is not None
-            else sbom.get("sbom_input_sha256"),
-            "mapping_sha256": sbom.get("mapping_sha256"),
-        },
-        "osv": {
-            "exists": _bool_exists(osv_current),
-            "path": osv_current,
-            "status": osv.get("status"),
-            "correlation_version": osv.get("correlation_version"),
-            "query_count": osv.get("query_count", 0),
-            "vulnerability_count": vulnerability_count,
-            "finding_ids": _as_list(osv.get("finding_ids")),
-        },
+        "sbom": _state_with_source(
+            {
+                "exists": _bool_exists(sbom_current),
+                "path": sbom_current,
+                "version": sbom.get("version"),
+                "input_sha256": sbom.get("input_sha256")
+                if sbom.get("input_sha256") is not None
+                else sbom.get("sbom_input_sha256"),
+                "mapping_sha256": sbom.get("mapping_sha256"),
+            },
+            source=advisory_channel,
+        ),
+        "osv": _state_with_source(
+            {
+                "exists": _bool_exists(osv_current),
+                "path": osv_current,
+                "status": osv.get("status"),
+                "correlation_version": osv.get("correlation_version"),
+                "query_count": osv.get("query_count", 0),
+                "vulnerability_count": vulnerability_count,
+                "finding_ids": _as_list(osv.get("finding_ids")),
+            },
+            source=advisory_channel,
+        ),
         "vulnerabilities": sorted(vulnerabilities, key=_vulnerability_id),
     }
+
+
+def _artifact_merge_key(artifact: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(artifact.get("subdir") or ""),
+        str(artifact.get("filename") or ""),
+    )
+
+
+def _merge_channel_refs(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        for value in _as_list(artifact.get("advisory_channels")):
+            if isinstance(value, dict):
+                refs.append(value)
+    return _vulnerability_channels({"advisory_channels": refs})
+
+
+def _state_priority(state: dict[str, Any]) -> int:
+    priority = state.get("advisory_channel_priority")
+    return priority if isinstance(priority, int) else -1
+
+
+def _state_layer(state: dict[str, Any]) -> dict[str, Any]:
+    layer = {
+        "exists": state.get("exists", False),
+        "path": state.get("path"),
+        "advisory_channel": state.get("advisory_channel"),
+        "advisory_channel_uri": state.get("advisory_channel_uri"),
+        "advisory_channel_priority": state.get("advisory_channel_priority"),
+    }
+    for key in (
+        "status",
+        "version",
+        "correlation_version",
+        "query_count",
+        "vulnerability_count",
+        "finding_ids",
+    ):
+        if state.get(key) is not None:
+            layer[key] = state.get(key)
+    return layer
+
+
+def _merge_artifact_state(
+    artifacts: list[dict[str, Any]],
+    *,
+    key: str,
+) -> dict[str, Any]:
+    states = [artifact.get(key) for artifact in artifacts]
+    states = [state for state in states if isinstance(state, dict)]
+    if not states:
+        return {"exists": False, "path": None}
+    existing = [state for state in states if state.get("exists")]
+    candidates = existing or states
+    selected = max(candidates, key=_state_priority)
+    merged = dict(selected)
+    merged["exists"] = bool(existing)
+    layers = [_state_layer(state) for state in states]
+    if layers:
+        merged["layers"] = layers
+    return merged
+
+
+def _merge_layered_artifacts(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for artifact in artifacts:
+        grouped.setdefault(_artifact_merge_key(artifact), []).append(artifact)
+
+    merged_artifacts: list[dict[str, Any]] = []
+    for key in sorted(grouped):
+        items = sorted(
+            grouped[key],
+            key=lambda item: max(
+                [
+                    int(channel.get("priority"))
+                    for channel in _as_list(item.get("advisory_channels"))
+                    if isinstance(channel, dict)
+                    and isinstance(channel.get("priority"), int)
+                ]
+                or [-1]
+            ),
+        )
+        selected = items[-1]
+        vulnerabilities = _dedupe_vulnerabilities(
+            [
+                vulnerability
+                for item in items
+                for vulnerability in _as_list(item.get("vulnerabilities"))
+                if isinstance(vulnerability, dict)
+            ]
+        )
+        merged_osv = _merge_artifact_state(items, key="osv")
+        finding_ids = [
+            vuln_id
+            for vuln_id in (
+                _vulnerability_identifier(vulnerability)
+                for vulnerability in vulnerabilities
+            )
+            if vuln_id is not None
+        ]
+        if finding_ids:
+            merged_osv["finding_ids"] = sorted(dict.fromkeys(finding_ids))
+            merged_osv["vulnerability_count"] = len(finding_ids)
+            merged_osv["status"] = "vulnerabilities_found"
+        else:
+            merged_osv["finding_ids"] = _unique_sorted(
+                [
+                    str(finding_id)
+                    for item in items
+                    for finding_id in _as_list(_as_dict(item.get("osv")).get("finding_ids"))
+                    if finding_id
+                ]
+            )
+            merged_osv["vulnerability_count"] = len(merged_osv["finding_ids"])
+            if not merged_osv["exists"]:
+                merged_osv["status"] = "missing"
+            elif not merged_osv["finding_ids"]:
+                merged_osv["status"] = "no_known_vulnerabilities"
+
+        component_purls = _unique_sorted(
+            [
+                str(component_purl)
+                for item in items
+                for component_purl in _as_list(item.get("component_purls"))
+                if component_purl
+            ]
+        )
+        merged_artifacts.append(
+            {
+                "filename": selected.get("filename"),
+                "name": selected.get("name"),
+                "version": selected.get("version"),
+                "subdir": selected.get("subdir"),
+                "build": selected.get("build"),
+                "conda_purl": selected.get("conda_purl"),
+                "advisory_channels": _merge_channel_refs(items),
+                "component_purls": component_purls,
+                "sbom": _merge_artifact_state(items, key="sbom"),
+                "osv": merged_osv,
+                "vulnerabilities": vulnerabilities,
+            }
+        )
+    return merged_artifacts
 
 
 def artifacts_from_indexes(
@@ -510,6 +906,9 @@ def artifacts_from_indexes(
 ) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     for index in subdir_indexes:
+        advisory_channel = index.get("_advisory_channel")
+        if not isinstance(advisory_channel, dict):
+            advisory_channel = None
         packages = index.get("packages")
         if not isinstance(packages, dict):
             continue
@@ -521,8 +920,10 @@ def artifacts_from_indexes(
                     filename=filename,
                     record=record,
                     vulnerabilities_by_advisory=vulnerabilities_by_advisory,
+                    advisory_channel=advisory_channel,
                 )
             )
+    artifacts = _merge_layered_artifacts(artifacts)
     artifacts.sort(
         key=lambda item: (
             str(item.get("name") or ""),
@@ -546,7 +947,13 @@ def _dedupe_vulnerabilities(
             "id": vuln_id,
             "url": _url_for_vulnerability(vuln_id, vulnerability.get("url")),
         }
-        by_key.setdefault(_vulnerability_id(normalized), normalized)
+        key = _vulnerability_id(normalized)
+        existing = by_key.get(key)
+        by_key[key] = (
+            normalized
+            if existing is None
+            else _merge_vulnerability(existing, normalized)
+        )
     return [by_key[key] for key in sorted(by_key)]
 
 
@@ -720,6 +1127,7 @@ def dashboard_payload(
     subdir_indexes: list[dict[str, Any]],
     mappings: dict[str, dict[str, Any]],
     osv_summary: dict[str, Any],
+    advisory_channels: list[AdvisoryChannelSource] | None = None,
 ) -> dict[str, Any]:
     vulnerabilities_by_package, vulnerabilities_by_advisory = vulnerability_indexes(
         osv_summary
@@ -746,11 +1154,21 @@ def dashboard_payload(
         )
         for name in package_names
     }
+    channels = advisory_channels or [
+        {
+            "name": _default_channel_name(s3_uri, priority=0),
+            "s3_uri": s3_uri,
+            "priority": 0,
+            "channel_index_generated_at": channel_index.get("generated_at"),
+        }
+    ]
     return {
         "schema_version": ADVISORY_DASHBOARD_SCHEMA_VERSION,
         "generated_at": _now(),
         "sources": {
             "s3_uri": s3_uri,
+            "s3_uris": [channel["s3_uri"] for channel in channels],
+            "advisory_channels": channels,
             "mapping_json": str(mapping_json),
             "osv_summary": str(osv_summary_path) if osv_summary_path else None,
             "channel_index_generated_at": channel_index.get("generated_at"),
@@ -814,7 +1232,8 @@ def upload_dashboard_payload(
 
 def build_dashboard_data(
     *,
-    s3_uri: str,
+    s3_uri: str | None,
+    advisory_channels: list[AdvisoryChannelSource] | None = None,
     mapping_json: Path,
     osv_summary_path: Path,
     skip_osv_summary: bool = False,
@@ -823,25 +1242,57 @@ def build_dashboard_data(
     region: str | None = None,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
-    channel_index, subdir_indexes = load_s3_advisory_indexes(
+    channels = advisory_channels or resolve_advisory_channels(
         s3_uri=s3_uri,
-        profile=profile,
-        region=region,
-        workers=workers,
-        runner=runner,
+        advisory_channel_args=[],
     )
+    subdir_indexes: list[dict[str, Any]] = []
+    channel_indexes: list[dict[str, Any]] = []
+    resolved_channels: list[AdvisoryChannelSource] = []
+    for channel in channels:
+        channel_s3_uri = _source_uri(channel)
+        if channel_s3_uri is None:
+            raise DashboardDataError("advisory channel source is missing s3_uri")
+        channel_index, channel_subdir_indexes = load_s3_advisory_indexes(
+            s3_uri=channel_s3_uri,
+            profile=profile,
+            region=region,
+            workers=workers,
+            runner=runner,
+        )
+        channel_indexes.append(channel_index)
+        source = {
+            **channel,
+            "channel_index_generated_at": channel_index.get("generated_at"),
+        }
+        resolved_channels.append(source)
+        for subdir_index in channel_subdir_indexes:
+            subdir_indexes.append(
+                {
+                    **subdir_index,
+                    "_advisory_channel": source,
+                }
+            )
     mappings = load_mapping_by_name(mapping_json)
     osv_summary = empty_osv_summary() if skip_osv_summary else load_osv_summary(
         osv_summary_path
     )
+    primary_s3_uri = (
+        _source_uri(resolved_channels[0])
+        if resolved_channels
+        else s3_uri
+    )
+    if primary_s3_uri is None:
+        raise DashboardDataError("no advisory channel source configured")
     return dashboard_payload(
-        s3_uri=s3_uri,
+        s3_uri=primary_s3_uri,
         mapping_json=mapping_json,
         osv_summary_path=None if skip_osv_summary else osv_summary_path,
-        channel_index=channel_index,
+        channel_index=channel_indexes[0] if channel_indexes else {},
         subdir_indexes=subdir_indexes,
         mappings=mappings,
         osv_summary=osv_summary,
+        advisory_channels=resolved_channels,
     )
 
 
@@ -886,6 +1337,18 @@ def main() -> None:
             "JSON; the output filename is written below this prefix"
         ),
     )
+    parser.add_argument(
+        "--advisory-channel",
+        action="append",
+        default=[],
+        metavar="NAME=SOURCE",
+        help=(
+            "advisory channel layer to include; repeat to build a layered "
+            "dashboard. SOURCE may be an s3:// prefix or a local channel root. "
+            "Later entries have higher display priority. If omitted, --s3-uri "
+            "is used as a single channel."
+        ),
+    )
     add_s3_args(parser, include_cleanup=False, include_dry_run=False)
     add_logging_args(parser, command_name="advisory-dashboard-data")
     args = parser.parse_args()
@@ -896,12 +1359,15 @@ def main() -> None:
     )
 
     try:
-        if not args.s3_uri:
-            raise DashboardDataError("--s3-uri is required")
+        advisory_channels = resolve_advisory_channels(
+            s3_uri=args.s3_uri,
+            advisory_channel_args=args.advisory_channel,
+        )
         LOGGER.info(
-            "starting dashboard data build s3_uri=%s mapping_json=%s "
+            "starting dashboard data build s3_uri=%s advisory_channels=%s mapping_json=%s "
             "osv_summary=%s skip_osv_summary=%s out=%s workers=%d s3_output_uri=%s",
             args.s3_uri,
+            advisory_channels,
             args.mapping_json,
             args.osv_summary,
             args.skip_osv_summary,
@@ -911,6 +1377,7 @@ def main() -> None:
         )
         payload = build_dashboard_data(
             s3_uri=args.s3_uri,
+            advisory_channels=advisory_channels,
             mapping_json=args.mapping_json,
             osv_summary_path=args.osv_summary,
             skip_osv_summary=args.skip_osv_summary,

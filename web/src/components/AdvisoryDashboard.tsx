@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type {
+  AdvisoryChannelSource,
+  AdvisoryDashboardPayload,
   AdvisoryVulnerability,
   DashboardArtifact,
   DashboardPackage,
@@ -57,6 +59,23 @@ const VULNERABILITY_SORT_OPTIONS: Array<{
   { value: "oldest", label: "Oldest" },
   { value: "id", label: "ID" },
 ];
+
+function dashboardSourceLabel(payload: AdvisoryDashboardPayload): string {
+  const channels = payload.sources.advisory_channels ?? [];
+  if (channels.length > 1) return `${channels.length} advisory channels`;
+  return payload.sources.s3_uri;
+}
+
+function dashboardSourceTitle(payload: AdvisoryDashboardPayload): string {
+  const channels = payload.sources.advisory_channels ?? [];
+  if (channels.length === 0) return payload.sources.s3_uri;
+  return channels
+    .map((channel) => {
+      const name = channel.name ?? "channel";
+      return channel.s3_uri ? `${name}: ${channel.s3_uri}` : name;
+    })
+    .join("\n");
+}
 
 function uniqueSorted(values: Array<string | null | undefined>): string[] {
   return Array.from(new Set(values.filter((value): value is string => Boolean(value))))
@@ -262,12 +281,81 @@ function vulnerabilityUrl(vuln: AdvisoryVulnerability): string | null {
   if (vuln.url) return vuln.url;
   for (const value of [vuln.id, vuln.vulnerability_id]) {
     const cleaned = value?.trim();
+    if (cleaned?.startsWith("CONDA-")) return null;
     if (cleaned?.startsWith("http://") || cleaned?.startsWith("https://")) {
       return cleaned;
     }
   }
   const id = vulnerabilityId(vuln);
   return id ? `https://osv.dev/vulnerability/${encodeURIComponent(id)}` : null;
+}
+
+function normalizeChannels(
+  channels: AdvisoryChannelSource[],
+): AdvisoryChannelSource[] {
+  const seen = new Set<string>();
+  return channels
+    .filter((channel) => channel.name || channel.s3_uri)
+    .filter((channel) => {
+      const key = `${channel.name ?? ""}\n${channel.s3_uri ?? ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => {
+      const ap = typeof a.priority === "number" ? a.priority : 0;
+      const bp = typeof b.priority === "number" ? b.priority : 0;
+      if (ap !== bp) return ap - bp;
+      return String(a.name ?? a.s3_uri ?? "").localeCompare(
+        String(b.name ?? b.s3_uri ?? ""),
+      );
+    });
+}
+
+function vulnerabilityChannels(
+  vuln: AdvisoryVulnerability,
+): AdvisoryChannelSource[] {
+  const channels: AdvisoryChannelSource[] = [];
+  if (Array.isArray(vuln.advisory_channels)) {
+    channels.push(...vuln.advisory_channels);
+  }
+  if (vuln.advisory_channel) {
+    channels.push({
+      name: vuln.advisory_channel,
+      s3_uri: vuln.advisory_channel_uri,
+      priority: vuln.advisory_channel_priority,
+    });
+  }
+  return normalizeChannels(channels);
+}
+
+function stateChannels(state: DashboardArtifact["osv"]): AdvisoryChannelSource[] {
+  const channels: AdvisoryChannelSource[] = [];
+  if (Array.isArray(state.layers)) {
+    for (const layer of state.layers) {
+      channels.push({
+        name: layer.advisory_channel,
+        s3_uri: layer.advisory_channel_uri,
+        priority: layer.advisory_channel_priority,
+      });
+    }
+  }
+  if (state.advisory_channel || state.advisory_channel_uri) {
+    channels.push({
+      name: state.advisory_channel,
+      s3_uri: state.advisory_channel_uri,
+      priority: state.advisory_channel_priority,
+    });
+  }
+  return channels;
+}
+
+function artifactChannels(artifact: DashboardArtifact): AdvisoryChannelSource[] {
+  return normalizeChannels([
+    ...(artifact.advisory_channels ?? []),
+    ...stateChannels(artifact.sbom),
+    ...stateChannels(artifact.osv),
+  ]);
 }
 
 function compareVulnerabilitiesById(
@@ -409,6 +497,39 @@ function Badge({
       }}
     >
       {children}
+    </span>
+  );
+}
+
+function ChannelPill({
+  channel,
+  theme,
+}: {
+  channel: AdvisoryChannelSource;
+  theme: Theme;
+}) {
+  const label = channel.name ?? channel.s3_uri ?? "channel";
+  return (
+    <span
+      title={channel.s3_uri ?? label}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        minHeight: 22,
+        maxWidth: 180,
+        padding: "2px 7px",
+        borderRadius: 4,
+        border: `1px solid ${theme.t.border}`,
+        background: theme.t.surface,
+        color: theme.t.fg2,
+        fontSize: 10.5,
+        fontWeight: 700,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
     </span>
   );
 }
@@ -830,6 +951,7 @@ function VulnerabilityList({
       {sortedVulnerabilities.map((vuln, index) => {
         const id = vulnerabilityId(vuln);
         const url = vulnerabilityUrl(vuln);
+        const channels = vulnerabilityChannels(vuln);
         return (
           <div
             key={`${id ?? vuln.url ?? "unknown"}-${vuln.component_purl}-${index}`}
@@ -891,7 +1013,7 @@ function VulnerabilityList({
                 style={{
                   display: "flex",
                   alignItems: "center",
-                  justifyContent: "space-between",
+                  justifyContent: "flex-start",
                   flexWrap: "wrap",
                   gap: 7,
                   minWidth: 0,
@@ -902,9 +1024,17 @@ function VulnerabilityList({
                     {severityDisplay(vuln)}
                   </Badge>
                 </span>
+                {channels.map((channel) => (
+                  <ChannelPill
+                    key={`${channel.name ?? ""}-${channel.s3_uri ?? ""}`}
+                    channel={channel}
+                    theme={theme}
+                  />
+                ))}
                 {vuln.modified ? (
                   <span
                     style={{
+                      marginLeft: "auto",
                       color: theme.t.fg3,
                       fontSize: 11,
                       overflowWrap: "anywhere",
@@ -1283,6 +1413,7 @@ function ArtifactDetail({
   }
 
   const vulnCount = artifact.osv.vulnerability_count ?? 0;
+  const channels = artifactChannels(artifact);
   return (
     <section
       style={{
@@ -1360,6 +1491,28 @@ function ArtifactDetail({
       </DetailRow>
       <DetailRow label="Conda PURL" theme={theme}>
         <MonospaceValue value={artifact.conda_purl} theme={theme} />
+      </DetailRow>
+      <DetailRow label="Channels" theme={theme}>
+        {channels.length === 0 ? (
+          <span style={{ color: theme.t.fg3 }}>—</span>
+        ) : (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: 6,
+            }}
+          >
+            {channels.map((channel) => (
+              <ChannelPill
+                key={`${channel.name ?? ""}-${channel.s3_uri ?? ""}`}
+                channel={channel}
+                theme={theme}
+              />
+            ))}
+          </div>
+        )}
       </DetailRow>
       <DetailRow label="SBOM" theme={theme}>
         <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
@@ -1539,6 +1692,9 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
     );
   }
 
+  const sourceLabel = dashboardSourceLabel(payload);
+  const sourceTitle = dashboardSourceTitle(payload);
+
   return (
     <div
       style={{
@@ -1622,9 +1778,9 @@ export function AdvisoryDashboard({ theme }: { theme: Theme }) {
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
             }}
-            title={payload.sources.s3_uri}
+            title={sourceTitle}
           >
-            {payload.sources.s3_uri}
+            {sourceLabel}
           </span>
         </div>
       </div>

@@ -52,6 +52,7 @@ SECURITY_CVE_SCHEMA = "cve.v1"
 SECURITY_MATCH_SCHEMA = "match.v1"
 SECURITY_ADVISORIES_SCHEMA = "advisories.v1"
 OSV_VULNERABILITY_URL_BASE = "https://osv.dev/vulnerability"
+CHANNEL_LOCAL_ID_PREFIXES = ("CONDA-",)
 LOGGER = logging.getLogger("scripts.correlate_osv")
 
 
@@ -609,13 +610,22 @@ def osv_vulnerability_url(vulnerability_id: str) -> str:
     return f"{OSV_VULNERABILITY_URL_BASE}/{quote(vulnerability_id, safe='')}"
 
 
+def default_osv_vulnerability_url(vulnerability_id: str) -> str | None:
+    if vulnerability_id.startswith(CHANNEL_LOCAL_ID_PREFIXES):
+        return None
+    return osv_vulnerability_url(vulnerability_id)
+
+
 def _vulnerability_with_url(vulnerability: dict[str, Any]) -> dict[str, Any]:
     vuln_id = vulnerability.get("id")
     if not isinstance(vuln_id, str):
         return vulnerability
+    url = vulnerability.get("url") or default_osv_vulnerability_url(vuln_id)
+    if not url:
+        return vulnerability
     return {
         **vulnerability,
-        "url": vulnerability.get("url") or osv_vulnerability_url(vuln_id),
+        "url": url,
     }
 
 
@@ -634,7 +644,7 @@ def _flatten_findings(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "component_name": component.get("name"),
                     "component_version": component.get("version"),
                     "vulnerability_id": vuln_id,
-                    "url": vuln.get("url") or osv_vulnerability_url(vuln_id),
+                    "url": vuln.get("url") or default_osv_vulnerability_url(vuln_id),
                     "modified": vuln.get("modified"),
                 }
             )
@@ -892,14 +902,20 @@ def _cve_payload(
     vuln_id = vulnerability.get("id")
     if not isinstance(vuln_id, str) or not vuln_id:
         raise OsvError("vulnerability is missing id")
+    source = vulnerability.get("source")
+    if not isinstance(source, dict):
+        source = {
+            "name": "osv.dev",
+            "api": api_url,
+        }
+    url = vulnerability.get("url")
+    if not isinstance(url, str) or not url:
+        url = default_osv_vulnerability_url(vuln_id)
     return {
         "schema_version": 1,
         "id": vuln_id,
-        "url": osv_vulnerability_url(vuln_id),
-        "source": {
-            "name": "osv.dev",
-            "api": api_url,
-        },
+        "url": url,
+        "source": source,
         "modified": vulnerability.get("modified"),
         "osv": vulnerability,
     }

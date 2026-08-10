@@ -138,6 +138,32 @@ export type AdvisoryVulnerability = {
   severity_score?: number | null;
   severity_vector?: string | null;
   severity_source?: string | null;
+  advisory_channel?: string | null;
+  advisory_channel_uri?: string | null;
+  advisory_channel_priority?: number | null;
+  advisory_channels?: AdvisoryChannelSource[];
+  source_advisories?: string[];
+};
+
+export type AdvisoryChannelSource = {
+  name?: string | null;
+  s3_uri?: string | null;
+  priority?: number | null;
+  channel_index_generated_at?: string | null;
+};
+
+export type AdvisoryArtifactStateLayer = {
+  exists: boolean;
+  path?: string | null;
+  advisory_channel?: string | null;
+  advisory_channel_uri?: string | null;
+  advisory_channel_priority?: number | null;
+  status?: string | null;
+  version?: string | null;
+  correlation_version?: string | null;
+  query_count?: number;
+  vulnerability_count?: number;
+  finding_ids?: string[];
 };
 
 export type AdvisoryArtifactState = {
@@ -151,6 +177,10 @@ export type AdvisoryArtifactState = {
   query_count?: number;
   vulnerability_count?: number;
   finding_ids?: string[];
+  advisory_channel?: string | null;
+  advisory_channel_uri?: string | null;
+  advisory_channel_priority?: number | null;
+  layers?: AdvisoryArtifactStateLayer[];
 };
 
 export type DashboardArtifact = {
@@ -160,6 +190,7 @@ export type DashboardArtifact = {
   subdir: string | null;
   build: string | null;
   conda_purl: string | null;
+  advisory_channels?: AdvisoryChannelSource[];
   component_purls: string[];
   sbom: AdvisoryArtifactState;
   osv: AdvisoryArtifactState;
@@ -209,6 +240,8 @@ export type AdvisoryDashboardPayload = {
   generated_at: string;
   sources: {
     s3_uri: string;
+    s3_uris?: string[];
+    advisory_channels?: AdvisoryChannelSource[];
     mapping_json: string;
     osv_summary: string | null;
     channel_index_generated_at?: string | null;

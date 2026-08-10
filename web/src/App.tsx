@@ -1,54 +1,52 @@
-import { useEffect, useMemo, useState } from "react";
-import { useGithubAuth } from "./auth/useGithubAuth";
+import { useEffect, useState } from "react";
 import { AdvisoryDashboard } from "./components/AdvisoryDashboard";
-import { BulkPanel } from "./components/BulkPanel";
 import { LoadingToast } from "./components/LoadingToast";
-import { LocalDraftBanner } from "./components/LocalDraftBanner";
-import { LoginModal } from "./components/LoginModal";
-import { MappingEditor } from "./components/MappingEditor";
-import { PackageTable } from "./components/PackageTable";
-import { PRDrawer } from "./components/PRDrawer";
-import { Btn, Glyph, useTheme } from "./components/Primitives";
-import { repoFullName } from "./config";
-import { purlsFromAlternatives } from "./data/purlAlternatives";
-import type { Edit, MappingPackageIndex, PackageEntry } from "./data/types";
-import { useMappingsData } from "./data/useMappingsData";
-import { usePurlEditStore } from "./stores/userState";
+import { PurlMapperView } from "./components/PurlMapperView";
+import { Glyph, useTheme } from "./components/Primitives";
+
+type AppView = "advisory" | "mapper";
+
+function viewFromLocation(): AppView {
+  const hash = window.location.hash.replace(/^#\/?/, "").toLowerCase();
+  if (hash.startsWith("mapper")) return "mapper";
+  if (hash.startsWith("purl")) return "mapper";
+  return "advisory";
+}
+
+function routeForView(view: AppView): string {
+  return view === "mapper" ? "#/mapper" : "#/advisory";
+}
 
 export function App() {
   const theme = useTheme();
-  const [activeView, setActiveView] = useState<"dashboard" | "mapper">(
-    "dashboard",
-  );
-  const {
-    payload,
-    packages,
-    loadError,
-    detailError,
-    details,
-    loadingDetails,
-    ensurePackageDetail,
-  } = useMappingsData();
-  const [selectedSet, setSelectedSet] = useState<Set<string>>(new Set());
-  const [focusedId, setFocusedId] = useState<string | null>(null);
-  const edits = usePurlEditStore((state) => state.edits);
-  const setEdits = usePurlEditStore((state) => state.setEdits);
-  const [q, setQ] = useState("");
-  const [filters, setFilters] = useState({
-    unmappedOnly: false,
-    unverifiedOnly: false,
-    ecosystem: "all",
-  });
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [loginOpen, setLoginOpen] = useState(false);
-  const { token, user, error: authError, isLoggedIn, signOut } = useGithubAuth();
-
+  const [activeView, setActiveView] = useState<AppView>(() => viewFromLocation());
   const t = theme.t;
-  const navButton = (view: "dashboard" | "mapper", label: string) => {
+
+  useEffect(() => {
+    function syncView() {
+      setActiveView(viewFromLocation());
+    }
+    window.addEventListener("hashchange", syncView);
+    window.addEventListener("popstate", syncView);
+    return () => {
+      window.removeEventListener("hashchange", syncView);
+      window.removeEventListener("popstate", syncView);
+    };
+  }, []);
+
+  function navigate(view: AppView): void {
+    const route = routeForView(view);
+    if (window.location.hash !== route) {
+      window.history.pushState(null, "", route);
+    }
+    setActiveView(view);
+  }
+
+  const navButton = (view: AppView, label: string) => {
     const active = activeView === view;
     return (
       <button
-        onClick={() => setActiveView(view)}
+        onClick={() => navigate(view)}
         style={{
           color: active ? t.fg1 : t.fg2,
           padding: "5px 8px",
@@ -66,142 +64,6 @@ export function App() {
       </button>
     );
   };
-
-  // Default: when packages first arrive, focus the first row (but don't
-  // mark it as selected — selection is the checkbox state).
-  useEffect(() => {
-    if (focusedId === null && packages.length > 0) {
-      setFocusedId(packages[0].name);
-    }
-  }, [packages, focusedId]);
-
-  useEffect(() => {
-    if (focusedId && !details[focusedId]) {
-      ensurePackageDetail(focusedId).catch(() => {
-        // detailError is set by the hook.
-      });
-    }
-  }, [details, ensurePackageDetail, focusedId]);
-
-  const focusedPkg = focusedId ? details[focusedId] ?? null : null;
-
-  const selectedPackages = useMemo(
-    () => packages.filter((p) => selectedSet.has(p.name)),
-    [packages, selectedSet],
-  );
-
-  const editsCount = Object.keys(edits).length;
-  const showBulk = selectedSet.size > 1;
-
-  function handleEdit(newEdit: Edit): void {
-    if (!focusedPkg) return;
-    const currentAltSet = new Set(
-      purlsFromAlternatives(focusedPkg.alternative_purls).sort(),
-    );
-    const editAltSet = new Set([...newEdit.alternative_purls].sort());
-    const altsMatch =
-      currentAltSet.size === editAltSet.size &&
-      [...currentAltSet].every((p) => editAltSet.has(p));
-    // CPEs are a set; an edit that ends up matching the package's current
-    // list is untouched, so the contribution keeps omitting the field.
-    const currentCpeSet = new Set(focusedPkg.cpes ?? []);
-    const cpesMatch =
-      newEdit.cpes === undefined ||
-      (newEdit.cpes.length === currentCpeSet.size &&
-        newEdit.cpes.every((c) => currentCpeSet.has(c)));
-    if (newEdit.cpes !== undefined && cpesMatch) {
-      newEdit = { ...newEdit, cpes: undefined };
-    }
-    const isSame =
-      !newEdit.unmapped &&
-      newEdit.purl === (focusedPkg.purl ?? "") &&
-      newEdit.type === (focusedPkg.type ?? "") &&
-      (newEdit.namespace || "") === (focusedPkg.namespace || "") &&
-      newEdit.pkgName === (focusedPkg.pkg_name ?? focusedPkg.name) &&
-      altsMatch &&
-      cpesMatch &&
-      !newEdit.note;
-    setEdits((prev) => {
-      const next = { ...prev };
-      if (isSame) delete next[focusedPkg.name];
-      else next[focusedPkg.name] = newEdit;
-      return next;
-    });
-  }
-
-  function approveOne(p: MappingPackageIndex | PackageEntry): Edit | null {
-    const auto = p.auto ?? {
-      purl: p.purl,
-      type: p.type,
-      namespace: p.namespace,
-      pkg_name: p.pkg_name,
-      alternative_purls: p.alternative_purls,
-    };
-    if (!auto.purl) return null;
-    return {
-      purl: auto.purl,
-      type: auto.type ?? "pypi",
-      namespace: auto.namespace ?? "",
-      pkgName: auto.pkg_name ?? p.name,
-      alternative_purls: purlsFromAlternatives(auto.alternative_purls),
-      unmapped: false,
-      note: "",
-      approved: true,
-    };
-  }
-
-  function handleApprove(): void {
-    if (!focusedPkg) return;
-    const e = approveOne(focusedPkg);
-    if (!e) return;
-    setEdits((prev) => ({ ...prev, [focusedPkg.name]: e }));
-  }
-
-  function handleResetAuto(): void {
-    if (!focusedPkg) return;
-    setEdits((prev) => {
-      const next = { ...prev };
-      delete next[focusedPkg.name];
-      return next;
-    });
-  }
-
-  function handleBulkApprove(): void {
-    setEdits((prev) => {
-      const next = { ...prev };
-      for (const p of selectedPackages) {
-        const e = approveOne(p);
-        if (e) next[p.name] = e;
-      }
-      return next;
-    });
-  }
-
-  function handleBulkMarkUnmapped(): void {
-    setEdits((prev) => {
-      const next = { ...prev };
-      for (const p of selectedPackages) {
-        next[p.name] = {
-          purl: "",
-          type: p.type ?? "generic",
-          namespace: p.namespace ?? "",
-          pkgName: p.pkg_name ?? p.name,
-          alternative_purls: [],
-          unmapped: true,
-          note: "",
-        };
-      }
-      return next;
-    });
-  }
-
-  function handleBulkResetSelected(): void {
-    setEdits((prev) => {
-      const next = { ...prev };
-      for (const p of selectedPackages) delete next[p.name];
-      return next;
-    });
-  }
 
   return (
     <div
@@ -225,11 +87,36 @@ export function App() {
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <img
-            src={theme.dark ? "./assets/logo_dark.svg" : "./assets/logo_light.svg"}
-            alt="prefix.dev"
-            style={{ height: 22 }}
-          />
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              minWidth: 170,
+              color: t.fg1,
+              fontSize: 13,
+              fontWeight: 800,
+              letterSpacing: "0",
+            }}
+          >
+            <span
+              style={{
+                width: 24,
+                height: 24,
+                borderRadius: 6,
+                border: `1px solid ${t.border}`,
+                background: t.inset,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                color: t.fg2,
+              }}
+            >
+              <Glyph name={activeView === "advisory" ? "db" : "edit"} size={13} />
+            </span>
+            {activeView === "advisory" ? "Advisory Channel" : "PURL Mapper"}
+          </div>
+
           <nav
             style={{
               display: "flex",
@@ -237,296 +124,42 @@ export function App() {
               fontSize: 11,
               fontWeight: 600,
               textTransform: "uppercase",
-              letterSpacing: ".08em",
-              borderLeft: `1px solid ${t.border}`,
-              paddingLeft: 14,
             }}
           >
-            {navButton("dashboard", "Advisory Dashboard")}
+            {navButton("advisory", "Advisory Dashboard")}
             {navButton("mapper", "PURL Mapper")}
           </nav>
-          <div
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              fontSize: 11,
-              padding: "3px 8px",
-              borderRadius: 4,
-              background: t.inset,
-              color: t.fg2,
-              fontFamily: "JetBrains Mono, monospace",
-            }}
-          >
-            <Glyph name="branch" size={11} />
-            {repoFullName}
-          </div>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button
-            onClick={() => theme.setDark(!theme.dark)}
-            style={{
-              background: t.surface2,
-              border: `1px solid ${t.border}`,
-              color: t.fg1,
-              borderRadius: 8,
-              width: 30,
-              height: 30,
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: "pointer",
-              fontSize: 14,
-            }}
-            title="Toggle theme"
-          >
-            {theme.dark ? "☀" : "☾"}
-          </button>
-
-          {activeView === "mapper" && (
-            <Btn
-              theme={theme}
-              variant={editsCount > 0 ? "primary" : "ghost"}
-              icon="pr"
-              onClick={() => setDrawerOpen(true)}
-              disabled={editsCount === 0}
-            >
-              {editsCount === 0
-                ? "No staged changes"
-                : `Review changes (${editsCount})`}
-            </Btn>
-          )}
-
-          {activeView === "mapper" && isLoggedIn && user ? (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 7,
-                  padding: "3px 8px 3px 4px",
-                  border: `1px solid ${t.border}`,
-                  borderRadius: 999,
-                }}
-              >
-                <img
-                  src={user.avatar_url}
-                  alt={user.login}
-                  width={22}
-                  height={22}
-                  style={{ borderRadius: "50%" }}
-                />
-                <span style={{ fontSize: 12, fontWeight: 600, color: t.fg1 }}>
-                  @{user.login}
-                </span>
-                <button
-                  onClick={signOut}
-                  title="Sign out"
-                  style={{
-                    background: "transparent",
-                    border: 0,
-                    color: t.fg3,
-                    cursor: "pointer",
-                    padding: 2,
-                    marginLeft: 2,
-                  }}
-                >
-                  <Glyph name="close" size={11} />
-                </button>
-              </div>
-            ) : activeView === "mapper" ? (
-            <Btn
-              theme={theme}
-              variant="secondary"
-              icon="github"
-              onClick={() => setLoginOpen(true)}
-            >
-              Sign in
-            </Btn>
-          ) : null}
-        </div>
+        <button
+          onClick={() => theme.setDark(!theme.dark)}
+          style={{
+            background: t.surface2,
+            border: `1px solid ${t.border}`,
+            color: t.fg1,
+            borderRadius: 8,
+            width: 30,
+            height: 30,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            fontSize: 14,
+          }}
+          title="Toggle theme"
+        >
+          {theme.dark ? "☀" : "☾"}
+        </button>
       </header>
 
-      {activeView === "mapper" && (
-        <LocalDraftBanner
-          theme={theme}
-          count={editsCount}
-          noun="change"
-          onReview={() => setDrawerOpen(true)}
-          onDiscard={() => {
-            if (window.confirm("Discard all locally saved staged changes?")) {
-              setEdits({});
-            }
-          }}
-        />
-      )}
-
-      {activeView === "mapper" && !isLoggedIn && (
-        <div
-          style={{
-            padding: "7px 18px",
-            background: theme.dark ? "#151c26" : "#eaf3ff",
-            borderBottom: `1px solid ${theme.dark ? "#26364a" : "#c7daf2"}`,
-            fontSize: 12,
-            color: t.fg1,
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
-        >
-          <Glyph name="edit" size={13} />
-          You can stage local PURL mapping changes without signing in. CPEs are shown as read-only identity metadata.
-          <button
-            onClick={() => setLoginOpen(true)}
-            style={{
-              background: "transparent",
-              border: 0,
-              color: t.link,
-              fontWeight: 600,
-              fontSize: 12,
-              cursor: "pointer",
-              padding: 0,
-            }}
-          >
-            Sign in with GitHub
-          </button>
-          when you're ready to open a PR.
-        </div>
-      )}
-
-      {activeView === "mapper" && authError && (
-        <div
-          style={{
-            padding: "7px 18px",
-            background: theme.dark ? "#3a1f1f" : "#ffe5dc",
-            color: t.bad,
-            fontSize: 12,
-          }}
-        >
-          Auth error: {authError}
-        </div>
-      )}
-
-      {activeView === "mapper" && (loadError || detailError) && (
-        <div
-          style={{
-            padding: "7px 18px",
-            background: theme.dark ? "#3a1f1f" : "#ffe5dc",
-            color: t.bad,
-            fontSize: 12,
-          }}
-        >
-          Failed to load mappings: {loadError || detailError}
-        </div>
-      )}
-
-      {activeView === "dashboard" ? (
+      {activeView === "advisory" ? (
         <div style={{ flex: 1, minHeight: 0 }}>
           <AdvisoryDashboard theme={theme} />
         </div>
       ) : (
-        <div
-          style={{
-            flex: 1,
-            display: "grid",
-            gridTemplateColumns: "minmax(0, 60fr) minmax(0, 40fr)",
-            minHeight: 0,
-          }}
-        >
-          <div style={{ minWidth: 0, minHeight: 0 }}>
-            {payload ? (
-              <PackageTable
-                theme={theme}
-                packages={packages}
-                edits={edits}
-                selectedSet={selectedSet}
-                setSelectedSet={setSelectedSet}
-                focusedId={focusedId}
-                setFocusedId={setFocusedId}
-                q={q}
-                setQ={setQ}
-                filters={filters}
-                setFilters={setFilters}
-              />
-            ) : (
-              <div
-                style={{
-                  padding: 30,
-                  color: t.fg2,
-                  textAlign: "center",
-                  fontSize: 13,
-                }}
-              >
-                Loading mappings…
-              </div>
-            )}
-          </div>
-
-          <div style={{ minWidth: 0, display: "flex" }}>
-            {showBulk ? (
-              <BulkPanel
-                theme={theme}
-                selectedPackages={selectedPackages}
-                edits={edits}
-                onApproveAll={handleBulkApprove}
-                onMarkUnmappedAll={handleBulkMarkUnmapped}
-                onResetSelected={handleBulkResetSelected}
-                onClearSelection={() => setSelectedSet(new Set())}
-              />
-            ) : focusedId && loadingDetails.has(focusedId) && !focusedPkg ? (
-              <div
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  background: t.page,
-                  color: t.fg2,
-                  fontSize: 13,
-                }}
-              >
-                Loading package details…
-              </div>
-            ) : (
-              <MappingEditor
-                theme={theme}
-                pkg={focusedPkg}
-                edit={focusedPkg ? edits[focusedPkg.name] : undefined}
-                onEdit={handleEdit}
-                onApprove={handleApprove}
-                onResetAuto={handleResetAuto}
-              />
-            )}
-          </div>
-        </div>
+        <PurlMapperView theme={theme} />
       )}
 
-      {activeView === "mapper" && drawerOpen && (
-        <PRDrawer
-          theme={theme}
-          edits={edits}
-          packages={details}
-          ensurePackageDetail={ensurePackageDetail}
-          onClose={() => setDrawerOpen(false)}
-          onCommit={() => {
-            setEdits({});
-            setDrawerOpen(false);
-          }}
-          isLoggedIn={isLoggedIn}
-          onRequestLogin={() => setLoginOpen(true)}
-          user={user}
-          onSelect={(id) => {
-            setSelectedSet(new Set([id]));
-            setFocusedId(id);
-            setDrawerOpen(false);
-          }}
-          token={token}
-        />
-      )}
-
-      {activeView === "mapper" && loginOpen && (
-        <LoginModal theme={theme} onClose={() => setLoginOpen(false)} />
-      )}
       <LoadingToast theme={theme} />
     </div>
   );
